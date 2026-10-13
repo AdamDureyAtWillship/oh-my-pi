@@ -8,6 +8,7 @@
  *    exactly, including the legitimate empty set.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
@@ -103,31 +104,6 @@ function armOrderLoop(
 
 class ExitFaultStorage extends FileSessionStorage {
 	failNextAtomicWrite = false;
-	#readGate:
-		| {
-				filePath: string;
-				started: ReturnType<typeof Promise.withResolvers<void>>;
-				release: ReturnType<typeof Promise.withResolvers<void>>;
-		  }
-		| undefined;
-
-	gateNextRead(filePath: string): { started: Promise<void>; release: () => void } {
-		const started = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		this.#readGate = { filePath, started, release };
-		return { started: started.promise, release: release.resolve };
-	}
-
-	override async readText(filePath: string): Promise<string> {
-		const gate = this.#readGate;
-		if (gate?.filePath === filePath) {
-			this.#readGate = undefined;
-			gate.started.resolve();
-			await gate.release.promise;
-		}
-		return super.readText(filePath);
-	}
-
 	override async writeTextAtomic(filePath: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
 		if (this.failNextAtomicWrite) {
 			this.failNextAtomicWrite = false;
@@ -492,13 +468,23 @@ describe("InteractiveMode vibe mode toggle", () => {
 		const suspend = vi.spyOn(registry, "suspendScope");
 		const terminate = vi.spyOn(registry, "killAll");
 
-		const readGate = storage.gateNextRead(sessionFile);
-		const switching = session.switchSession(sessionFile);
-		await readGate.started;
-		const suspendCallsBeforeRead = suspend.mock.calls.length;
-		readGate.release();
+		// The file-backed resume reads through its own descriptor, so observe the
+		// journal open itself: scope suspension must already have happened by then.
+		const openSync = fs.openSync;
+		let suspendCallsBeforeRead: number | undefined;
+		const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((...args: Parameters<typeof fs.openSync>) => {
+			if (suspendCallsBeforeRead === undefined && path.resolve(String(args[0])) === path.resolve(sessionFile))
+				suspendCallsBeforeRead = suspend.mock.calls.length;
+			return openSync(...args);
+		}) as typeof fs.openSync);
+		let switched: boolean;
+		try {
+			switched = await session.switchSession(sessionFile);
+		} finally {
+			openSpy.mockRestore();
+		}
+		expect(switched).toBe(true);
 		expect(suspendCallsBeforeRead).toBe(1);
-		expect(await switching).toBe(true);
 
 		expect(mode.vibeModeEnabled).toBe(true);
 		expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "todo", ...VIBE_TOOL_NAMES]));

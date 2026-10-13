@@ -10,6 +10,23 @@ export function generateId(byId: { has(id: string): boolean }): string {
 	return Snowflake.next(); // fallback to full snowflake id
 }
 
+/** Apply the v1 fields using IDs assigned by the array or streaming loader. */
+export function migrateV1SessionEntry(
+	entry: Exclude<FileEntry, SessionHeader>,
+	id: string,
+	parentId: string | null,
+	firstKeptEntryId?: string,
+): void {
+	entry.id = id;
+	entry.parentId = parentId;
+	if (entry.type === "compaction") {
+		const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
+		if (typeof comp.firstKeptEntryIndex === "number") {
+			if (firstKeptEntryId !== undefined) comp.firstKeptEntryId = firstKeptEntryId;
+			delete comp.firstKeptEntryIndex;
+		}
+	}
+}
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
 function migrateV1ToV2(entries: FileEntry[]): void {
 	const ids = new Set<string>();
@@ -21,21 +38,19 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 			continue;
 		}
 
-		entry.id = generateId(ids);
-		entry.parentId = prevId;
+		const targetIndex =
+			entry.type === "compaction"
+				? (entry as CompactionEntry & { firstKeptEntryIndex?: number }).firstKeptEntryIndex
+				: undefined;
+		const target = targetIndex === undefined ? undefined : entries[targetIndex];
+		const id = generateId(ids);
+		migrateV1SessionEntry(
+			entry,
+			id,
+			prevId,
+			target === entry ? id : target?.type !== "session" ? target?.id : undefined,
+		);
 		prevId = entry.id;
-
-		// Convert firstKeptEntryIndex to firstKeptEntryId for compaction
-		if (entry.type === "compaction") {
-			const comp = entry as CompactionEntry & { firstKeptEntryIndex?: number };
-			if (typeof comp.firstKeptEntryIndex === "number") {
-				const targetEntry = entries[comp.firstKeptEntryIndex];
-				if (targetEntry && targetEntry.type !== "session") {
-					comp.firstKeptEntryId = targetEntry.id;
-				}
-				delete comp.firstKeptEntryIndex;
-			}
-		}
 	}
 }
 

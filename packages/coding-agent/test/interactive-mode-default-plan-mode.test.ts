@@ -154,7 +154,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		return shouldEnterPlanModeOnStartup(
 			{
 				buildSessionContext: () => ({ messages: options.conversation ? [{}] : [] }) as never,
-				getEntries: () => (options.explicitMode ? [{ type: "mode_change" }] : []) as never,
+				hasEntryType: type => type === "mode_change" && options.explicitMode === true,
 			},
 			sessionSettings,
 		);

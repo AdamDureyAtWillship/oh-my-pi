@@ -693,16 +693,30 @@ describe("experimental context management", () => {
 		});
 		const notebookText = `Durable notebook:\n${"- task state entry line. ".repeat(64)}`;
 		await contextNotes.execute("save-notebook", { text: notebookText });
-		await session.compact();
-		const entry = manager
-			.getEntries()
-			.find((candidate): candidate is CompactionEntry => candidate.type === "compaction");
-		if (!entry) throw new Error("Expected a rollover boundary");
-		const expected =
-			computeNonMessageTokens(session, agent.tokenizer, session.settings.revision) +
-			agent.tokenizer.countMessages(convertToLlm(manager.buildSessionContext().messages));
-		expect(entry.tokensAfter).toBe(expected);
-		expect(entry.tokensAfter).toBeGreaterThan(agent.tokenizer.countMessages(manager.buildSessionContext().messages));
+		for (let round = 0; round < 3; round++) {
+			if (round > 0) {
+				const next = [
+					user(`request ${round}`),
+					assistant("intermediate result ".repeat(128)),
+					user(`retained request ${round}`),
+					assistant("latest result"),
+				];
+				for (const message of next) manager.appendMessage(message);
+				agent.replaceMessages(manager.buildSessionContext().messages);
+			}
+			await session.compact();
+			const entry = manager
+				.getEntries()
+				.findLast((candidate): candidate is CompactionEntry => candidate.type === "compaction");
+			if (!entry) throw new Error("Expected a rollover boundary");
+			const expected =
+				computeNonMessageTokens(session, agent.tokenizer, session.settings.revision) +
+				agent.tokenizer.countMessages(convertToLlm(manager.buildSessionContext().messages));
+			expect(entry.tokensAfter).toBe(expected);
+			expect(entry.tokensAfter).toBeGreaterThan(
+				agent.tokenizer.countMessages(manager.buildSessionContext().messages),
+			);
+		}
 	});
 
 	it("skips built-in remote memory recall during local rollover while preserving the boundary", async () => {

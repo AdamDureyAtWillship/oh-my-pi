@@ -1,5 +1,6 @@
+import * as fs from "node:fs";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import * as fs from "node:fs/promises";
+import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import {
 	ConcatSink,
@@ -23,9 +24,23 @@ import {
 	resolveImageDataUrl,
 	resolveImageDataUrlSync,
 } from "./blob-store";
-import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
-import { migrateToCurrentVersion } from "./session-migrations";
+import {
+	buildSessionContextFromLeafPath,
+	selectSessionContextEntriesFromLeafPath,
+	sessionContextEntryMetadata,
+	type SessionContextEntryMetadata,
+} from "./session-context";
+import {
+	CURRENT_SESSION_VERSION,
+	type CompactionEntry,
+	type FileEntry,
+	type RawFileEntry,
+	type SessionEntry,
+	type SessionHeader,
+	sessionEntryLeafId,
+} from "./session-entries";
+import { sanitizeRehydratedOpenAIResponsesAssistantMessage } from "./messages";
+import { generateId, migrateToCurrentVersion, migrateV1SessionEntry } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
 import { enotdir } from "./session-storage-errors";
@@ -41,8 +56,6 @@ const LF = new Uint8Array([0x0a]);
 const STREAM_LOAD_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const STREAM_YIELD_BYTES = 1 * 1024 * 1024;
 const STREAM_YIELD_ENTRIES = 8_192;
-/** Initial parse window after a malformed record; see the recovery note in visitEntriesFromFileStream. */
-const RECOVERY_PARSE_WINDOW = 64 * 1024;
 const BLOB_READ_CONCURRENCY = 8;
 
 /**
@@ -119,6 +132,10 @@ export interface VisitEntriesFromFileStreamOptions {
 	 * callers derive the exact snapshot size without re-stating the file.
 	 */
 	onBytesConsumed?: (bytes: number) => void;
+	/** Physical UTF-8 byte range of each valid record (including its newline, when present). */
+	onEntryPosition?: (entry: FileEntry, offset: number, length: number) => void;
+	/** Borrow an already-open source so scanning and indexed reads share one inode. */
+	sourceFd?: number;
 }
 
 /** Controls how a missing session file is handled. */
@@ -243,6 +260,41 @@ function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string |
 	return isValidSessionHeader(entry) ? entry.id : undefined;
 }
 
+/**
+ * Locate the first settled newline without parsing every growing line prefix.
+ * Keep the bounded recovery work of the streaming loader while recording exact ranges.
+ */
+function settledRecordEnd(view: Uint8Array, start: number, firstNewline: number): number {
+	const newlines: number[] = [];
+	let scanned = firstNewline + 1;
+	let tried = 0;
+	for (let target = 1; ; target *= 2) {
+		while (newlines.length < target) {
+			const next = view.indexOf(0x0a, scanned);
+			if (next < 0) break;
+			newlines.push(next);
+			scanned = next + 1;
+		}
+		if (newlines.length <= tried) return -1;
+		const settles = (index: number): boolean => {
+			const { values, error, done } = Bun.JSONL.parseChunk(view, start, newlines[index]! + 1);
+			return values.length > 0 || Boolean(error) || done;
+		};
+		if (settles(newlines.length - 1)) {
+			let low = tried;
+			let high = newlines.length - 1;
+			while (low < high) {
+				const middle = (low + high) >>> 1;
+				if (settles(middle)) high = middle;
+				else low = middle + 1;
+			}
+			return newlines[low]!;
+		}
+		tried = newlines.length;
+		if (newlines.length < target) return -1;
+	}
+}
+
 /** Parse session JSONL and visit each entry without retaining prior entries. */
 export async function visitEntriesFromFileStream(
 	filePath: string,
@@ -255,213 +307,164 @@ export async function visitEntriesFromFileStream(
 	let bytesSinceYield = 0;
 	let entriesSinceYield = 0;
 	let recordsSeen = 0;
-	const maxRecords = Math.max(0, options.maxRecords ?? Number.POSITIVE_INFINITY);
+	let sourceBytes = 0;
+	let offset = 0;
 	let stopped = false;
-	let visitorThrew = false;
+	const maxRecords = Math.max(0, options.maxRecords ?? Number.POSITIVE_INFINITY);
+	const maxBytes = Math.max(0, options.maxBytes ?? Number.POSITIVE_INFINITY);
 	const yieldEveryBytes = Math.max(0, options.yieldEveryBytes ?? STREAM_YIELD_BYTES);
 	const yieldEveryEntries = Math.max(0, options.yieldEveryEntries ?? STREAM_YIELD_ENTRIES);
-	const maxBytes = Math.max(0, options.maxBytes ?? Number.POSITIVE_INFINITY);
-	// Bytes, not text: a multibyte UTF-8 sequence straddling a chunk boundary
-	// stays intact, and Bun.JSONL.parseChunk takes typed arrays directly. Only
-	// the unconsumed remainder is held (≤ one record + a chunk), so the ≥8MiB
-	// memory guard holds — the file is never fully loaded.
 	const sink = new ConcatSink();
 	const decoder = new TextDecoder();
-
 	const yieldToMacrotask = async (): Promise<void> => {
-		if (yieldEveryBytes === 0 && yieldEveryEntries === 0) return;
-		const bytesReady = yieldEveryBytes === 0 || bytesSinceYield < yieldEveryBytes;
-		const entriesReady = yieldEveryEntries === 0 || entriesSinceYield < yieldEveryEntries;
-		if (bytesReady && entriesReady) {
-			return;
+		if (
+			(yieldEveryBytes > 0 && bytesSinceYield >= yieldEveryBytes) ||
+			(yieldEveryEntries > 0 && entriesSinceYield >= yieldEveryEntries)
+		) {
+			bytesSinceYield = 0;
+			entriesSinceYield = 0;
+			await Bun.sleep(0);
 		}
-		bytesSinceYield = 0;
-		entriesSinceYield = 0;
-		await Bun.sleep(0);
 	};
-
-	const hasPayload = (bytes: Uint8Array, start: number, end: number): boolean => {
-		for (let index = start; index < end; index++) {
-			const byte = bytes[index];
-			if (byte !== 0x09 && byte !== 0x0a && byte !== 0x0d && byte !== 0x20) return true;
-		}
-		return false;
-	};
-
-	const drain = async (endOfInput = false): Promise<void> => {
+	// Fast path: a record that is valid JSON on its own physical line. Anything
+	// else is decided by Bun.JSONL.parseChunk, as in the whole-buffer parsers:
+	// a value left unfinished at a newline extends to the next newline; a valid
+	// value followed by junk on its last line is visited with its exact byte
+	// range (`read`), and the junk to the newline is one malformed record; a
+	// value that never completes is one malformed record. The scanned range
+	// always ends at the first newline that can end the value, so it never holds
+	// more than one value.
+	const drain = async (atEnd = false): Promise<void> => {
 		const view = sink.flush();
 		if (!view) return;
-		// Only newline-terminated bytes may reach the parser: a trailing fragment
-		// in the same call turns an end-of-input `done` into a syntax error at the
-		// preceding newline, which would then be miscounted as a malformed record.
-		const lastNewline = view.lastIndexOf(0x0a);
-		if (lastNewline === -1) return;
-		let buffer: Uint8Array = view.subarray(0, lastNewline + 1);
 		let consumed = 0;
-		const advance = (count: number): void => {
-			consumed += count;
-			buffer = buffer.subarray(count);
+		const emit = async (entry: FileEntry, start: number, end: number): Promise<void> => {
+			if (!sawFirstEntry) {
+				sawFirstEntry = true;
+				applyTitleSlot(entry, titleSlot);
+			}
+			options.onEntryPosition?.(entry, offset + start, Math.min(end - start, sourceBytes - offset - start));
+			stopped = visit(entry) === false;
+			recordsSeen++;
+			entriesSinceYield++;
+			if (recordsSeen >= maxRecords) stopped = true;
+			await yieldToMacrotask();
 		};
-		// parseChunk costs time proportional to its whole input even when it stops at
-		// the first bad line, so recovering line by line over the full buffer is
-		// quadratic. After a malformed record, parse a newline-cut window that grows
-		// while the input keeps parsing and resets on the next error.
-		let window = Number.POSITIVE_INFINITY;
-		while (buffer.length > 0 && !stopped) {
-			if (recordsSeen >= maxRecords) {
+		const skipMalformed = (from: number, to: number): void => {
+			for (let index = from; index < to; index++) {
+				const byte = view[index];
+				if (byte !== 0x09 && byte !== 0x0d && byte !== 0x20) {
+					options.onMalformedRecord?.();
+					break;
+				}
+			}
+			recordsSeen++;
+			if (recordsSeen >= maxRecords) stopped = true;
+		};
+		while (consumed < view.length && !stopped) {
+			if (recordsSeen >= maxRecords || options.shouldContinue?.() === false) {
 				stopped = true;
 				break;
 			}
-			let input = buffer;
-			if (window < buffer.length) {
-				const cut = buffer.indexOf(0x0a, window - 1);
-				if (cut !== -1) input = buffer.subarray(0, cut + 1);
-			}
-			const partial = input.length < buffer.length;
-			const { values, error, read, done } = Bun.JSONL.parseChunk(input);
-			for (const value of values) {
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				if (options.shouldContinue && !options.shouldContinue()) {
-					stopped = true;
-					break;
-				}
-				const entry = value as FileEntry;
-				if (!sawFirstEntry) {
-					sawFirstEntry = true;
-					applyTitleSlot(entry, titleSlot);
-				}
-				try {
-					if (visit(entry) === false) {
-						stopped = true;
-						break;
-					}
-					recordsSeen++;
-					entriesSinceYield++;
-					if (recordsSeen >= maxRecords) {
-						stopped = true;
-						break;
-					}
-				} catch (err) {
-					visitorThrew = true;
-					throw err;
-				}
-				await yieldToMacrotask();
-			}
-			if (stopped) break;
-			if (error) {
-				// Malformed record: skip past the next newline and continue.
-				const nextNewline = buffer.indexOf(0x0a, read);
-				if (nextNewline === -1) break; // rest of the bad line not yet received
-				if (hasPayload(buffer, read, nextNewline)) options.onMalformedRecord?.();
-				recordsSeen++;
-				advance(nextNewline + 1);
-				window = RECOVERY_PARSE_WINDOW;
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				continue;
-			}
-			if (read === 0) {
-				if (partial) {
-					// The record runs past the window, not past the buffered input.
-					window *= 2;
+			const firstNewline = view.indexOf(0x0a, consumed);
+			if (firstNewline < 0) break;
+			const start = consumed;
+			const firstLine = decoder.decode(view.subarray(start, firstNewline)).trim();
+			if (!sawFirstLine) {
+				sawFirstLine = true;
+				const slot = firstLine ? parseTitleSlotLine(firstLine) : undefined;
+				if (slot) {
+					titleSlot = titleUpdateFromSlot(slot);
+					consumed = firstNewline + 1;
 					continue;
 				}
-				// Incomplete value awaiting more bytes. Once the input has ended nothing more
-				// is coming, so it is a truncated record (parseJsonlLenient counts it too).
-				if (endOfInput) {
-					if (hasPayload(buffer, 0, buffer.length)) options.onMalformedRecord?.();
-					recordsSeen++;
-					advance(buffer.length);
-				}
-				break;
 			}
-			advance(read);
-			if (done) {
-				// The parser reached the end of its input; whatever trails the last value is whitespace.
-				advance(input.length - read);
-				if (!partial) break;
-			}
-			if (partial) window *= 2;
-		}
-		sink.consume(consumed);
-	};
-
-	try {
-		// Capped by hand, not with `file.slice(0, maxBytes)`: on Bun 1.3.14 a slice's
-		// stream over a file that continues past the slice either stays pending after
-		// delivering its bytes (macOS) or ignores the bound and streams the whole
-		// file (Windows).
-		let unread = maxBytes;
-		for await (const streamed of Bun.file(filePath).stream()) {
-			if (stopped) break;
-			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
-			unread -= chunk.byteLength;
-			bytesSinceYield += chunk.byteLength;
-			options.onBytesConsumed?.(chunk.byteLength);
-			// Parsing before the chunk closes a line re-scans the unfinished record
-			// on every chunk, which is quadratic for large records.
-			if (chunk.lastIndexOf(0x0a) === -1) {
-				// Skipping drain() also skips the only enforcement of the record cap,
-				// so re-check it here: a delimiter-free file would otherwise be read
-				// and buffered in full despite an exhausted budget.
-				if (recordsSeen >= maxRecords) {
-					stopped = true;
-					break;
-				}
-				sink.append(chunk);
-				await yieldToMacrotask();
-				if (unread === 0) break;
+			if (!firstLine) {
+				consumed = firstNewline + 1;
 				continue;
 			}
-			sink.append(chunk);
-			// The optional fixed-width title slot is a physical first line that is
-			// NOT JSON; peel it before the parser would (correctly) reject it. The
-			// first line ends at a '\n' byte, so it is a complete UTF-8 sequence and
-			// safe to decode. A non-slot first line is a real entry and is left for
-			// the parser; a blank first line is left for the parser to skip.
-			if (!sawFirstLine) {
-				const buffered = sink.flush()!;
-				const newline = buffered.indexOf(0x0a);
-				if (newline !== -1) {
-					sawFirstLine = true;
-					const firstLine = decoder.decode(buffered.subarray(0, newline)).trim();
-					if (firstLine) {
-						const slot = parseTitleSlotLine(firstLine);
-						if (slot) {
-							titleSlot = titleUpdateFromSlot(slot);
-							sink.consume(newline + 1);
-						}
-					}
-				}
+			let lineEntry: FileEntry | undefined;
+			try {
+				lineEntry = JSON.parse(firstLine) as FileEntry;
+			} catch {}
+			if (lineEntry) {
+				consumed = firstNewline + 1;
+				await emit(lineEntry, start, consumed);
+				continue;
 			}
-			// parseChunk can leave a value unfinished even after a newline; the
-			// sink keeps that remainder for the next chunk.
-			await drain();
+			let recordEnd = firstNewline;
+			let awaitingMoreData = false;
+			while (true) {
+				const { values, error, read, done } = Bun.JSONL.parseChunk(view, start, recordEnd + 1);
+				if (values.length > 0) {
+					// `read` is the absolute end of the parsed value. On success the
+					// record keeps its trailing whitespace and newline.
+					const valueEnd = error ? read : recordEnd + 1;
+					consumed = recordEnd + 1;
+					await emit(values[0] as FileEntry, start, valueEnd);
+					if (error && !stopped) skipMalformed(read, recordEnd);
+					break;
+				}
+				if (error || done) {
+					// Malformed before any value: skip its physical line only.
+					const errorStart = Math.max(start, read);
+					const nextNewline = view.indexOf(0x0a, errorStart);
+					consumed = nextNewline + 1;
+					skipMalformed(errorStart, nextNewline);
+					break;
+				}
+				const nextNewline = settledRecordEnd(view, start, recordEnd);
+				if (nextNewline >= 0) {
+					recordEnd = nextNewline;
+					continue;
+				}
+				if (!atEnd) {
+					awaitingMoreData = true;
+					break;
+				}
+				// The value never completes before EOF: one malformed record.
+				consumed = view.length;
+				skipMalformed(start, view.length);
+				break;
+			}
+			if (awaitingMoreData) break;
+		}
+		sink.consume(consumed);
+		offset += consumed;
+	};
+	let source: AsyncIterable<Uint8Array>;
+	try {
+		if (options.sourceFd === undefined) {
+			source = Bun.file(filePath).stream();
+		} else {
+			source = fs.createReadStream(filePath, {
+				fd: options.sourceFd,
+				autoClose: false,
+				start: 0,
+			});
+		}
+		// Cap by hand: sliced Bun file streams can hang or ignore their bound.
+		let unread = maxBytes;
+		for await (const streamed of source) {
+			if (stopped || recordsSeen >= maxRecords || unread === 0) break;
+			const chunk = streamed.byteLength > unread ? streamed.subarray(0, unread) : streamed;
+			unread -= chunk.byteLength;
+			sourceBytes += chunk.byteLength;
+			bytesSinceYield += chunk.byteLength;
+			options.onBytesConsumed?.(chunk.byteLength);
+			sink.append(chunk);
+			if (chunk.includes(0x0a)) await drain();
 			await yieldToMacrotask();
 			if (unread === 0) break;
 		}
-		// A trailing record without a final newline: terminate it so the parser
-		// can complete it (readline yielded it; parseChunk needs the delimiter).
-		if (!stopped && !sink.isEmpty) {
-			sink.append(LF);
-			await drain(true);
-		}
 	} catch (err) {
-		if (visitorThrew) throw err;
-		if (options.throwIfMissing && (isEnoent(err) || isEnotdir(err))) {
-			throw err;
-		}
-		if (isEnoent(err)) {
-			return undefined;
-		}
+		if (!options.throwIfMissing && isEnoent(err) && sourceBytes === 0) return undefined;
 		throw err;
 	}
-
+	if (!stopped && recordsSeen < maxRecords && !sink.isEmpty) {
+		sink.append(LF);
+		await drain(true);
+	}
 	return titleSlot;
 }
 /** Exported for testing — the ≥8MiB streaming path (works on any file size). */
@@ -532,7 +535,7 @@ export async function hasFileAsPathComponent(filePath: string): Promise<boolean>
 	let current = path.resolve(filePath);
 	for (;;) {
 		try {
-			return !(await fs.stat(current)).isDirectory();
+			return !(await fsp.stat(current)).isDirectory();
 		} catch {
 			// Missing component: climb to the first existing ancestor.
 		}
@@ -589,6 +592,159 @@ export async function loadEntriesFromFile(
 	options?: { throwIfMissing?: boolean },
 ): Promise<FileEntry[]> {
 	return (await loadSessionFile(filePath, storage, options)).entries;
+}
+
+/** Physical payload source and migrated identity shared by resume and read-only history. */
+export interface PositionedSessionEntry extends SessionContextEntryMetadata {
+	offset: number;
+	length: number;
+	firstKeptEntryId?: string;
+}
+
+/** Stream canonical migrations; caller owns the returned source descriptor and must close or adopt it. */
+export async function visitSessionFileForResume(
+	filePath: string,
+	visit: (entry: SessionEntry, position: PositionedSessionEntry) => void,
+	options: LoadSessionOptions = {},
+): Promise<SessionLoadResult & { migrated: boolean; sourceFd?: number }> {
+	let sourceFd: number;
+	try {
+		sourceFd = fs.openSync(filePath, "r");
+	} catch (error) {
+		const err =
+			isEnoent(error) && process.platform === "win32" && (await hasFileAsPathComponent(filePath))
+				? enotdir(filePath)
+				: error;
+		if (options.throwIfMissing || !isEnoent(err)) throw err;
+		return {
+			entries: [],
+			titleSlot: undefined,
+			malformedRecords: 0,
+			sourceSize: null,
+			invalidHeader: false,
+			migrated: false,
+		};
+	}
+	let transferred = false;
+	try {
+		let header: SessionHeader | undefined;
+		let version = CURRENT_SESSION_VERSION;
+		let malformedRecords = 0;
+		let sourceSize = 0;
+		let invalidHeader = false;
+		let migrated = false;
+		let parentId: string | null = null;
+		const ids = new Set<string>();
+		const legacyIds: Array<string | undefined> = [undefined];
+		const rawIds: Array<string | undefined> = [undefined];
+		const forwardReferences: Array<{ position: PositionedSessionEntry; target: number }> = [];
+		const titleSlot = await visitEntriesFromFileStream(filePath, () => !invalidHeader, {
+			sourceFd,
+			throwIfMissing: options.throwIfMissing,
+			onBytesConsumed: bytes => {
+				sourceSize += bytes;
+			},
+			onMalformedRecord: () => {
+				malformedRecords++;
+			},
+			onEntryPosition: (entry, offset, length) => {
+				if (!header) {
+					if (!isValidSessionHeader(entry)) {
+						invalidHeader = true;
+						return;
+					}
+					header = entry;
+					version = header.version ?? 1;
+					header.version = Math.max(version, CURRENT_SESSION_VERSION);
+					migrated = version < CURRENT_SESSION_VERSION;
+					return;
+				}
+				const arrayIndex = legacyIds.length;
+				rawIds.push(entry.type === "session" ? undefined : entry.id);
+				if (entry.type === "session") {
+					legacyIds.push(undefined);
+					return;
+				}
+				const target =
+					version < 2 && entry.type === "compaction"
+						? (entry as CompactionEntry & { firstKeptEntryIndex?: number }).firstKeptEntryIndex
+						: undefined;
+				if (version < 2) {
+					const id = generateId(ids);
+					migrateV1SessionEntry(
+						entry,
+						id,
+						parentId,
+						target === arrayIndex ? id : target === undefined ? undefined : legacyIds[target],
+					);
+				}
+				legacyIds.push(entry.id);
+				ids.add(entry.id);
+				parentId = entry.id;
+				migrateToCurrentVersion([{ ...header, version: Math.max(version, 2) }, entry]);
+				if (entry.type === "message" && entry.message.role === "assistant") {
+					const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+					if (sanitized !== entry.message) {
+						entry.message = sanitized;
+						migrated = true;
+					}
+				}
+				const position: PositionedSessionEntry = {
+					...sessionContextEntryMetadata(entry),
+					offset,
+					length,
+					firstKeptEntryId: entry.type === "compaction" ? entry.firstKeptEntryId : undefined,
+				};
+				if (target !== undefined && target > arrayIndex) forwardReferences.push({ position, target });
+				visit(entry, position);
+			},
+		});
+		// Array migration reads a forward target's original id before that target is
+		// migrated. Preserve that exact behavior rather than inventing a future id.
+		for (const { position, target } of forwardReferences) {
+			if (rawIds[target] !== undefined) position.firstKeptEntryId = rawIds[target];
+		}
+		if (sourceSize > 0 && header && !invalidHeader) {
+			const lastByte = Buffer.allocUnsafe(1);
+			if (fs.readSync(sourceFd, lastByte, 0, 1, sourceSize - 1) === 1 && lastByte[0] !== 0x0a) migrated = true;
+			transferred = true;
+		}
+		return {
+			entries: header && !invalidHeader ? [header] : [],
+			titleSlot,
+			malformedRecords,
+			sourceSize,
+			sourceFd: transferred ? sourceFd : undefined,
+			invalidHeader: invalidHeader || (!header && malformedRecords > 0),
+			migrated,
+		};
+	} finally {
+		if (!transferred) fs.closeSync(sourceFd);
+	}
+}
+
+/** Read one record from an open inode; atomic replacement cannot invalidate its offsets. */
+export function readPositionedSessionEntry(fd: number, position: PositionedSessionEntry): SessionEntry {
+	const bytes = Buffer.allocUnsafe(position.length);
+	let read = 0;
+	while (read < bytes.length) {
+		const count = fs.readSync(fd, bytes, read, bytes.length - read, position.offset + read);
+		if (count === 0) throw new Error(`Session entry ${position.id} was truncated`);
+		read += count;
+	}
+	const entry = JSON.parse(bytes.toString("utf8")) as SessionEntry;
+	entry.id = position.id;
+	entry.parentId = position.parentId;
+	if (entry.type === "compaction") {
+		entry.firstKeptEntryId = position.firstKeptEntryId!;
+		delete (entry as CompactionEntry & { firstKeptEntryIndex?: number }).firstKeptEntryIndex;
+	}
+	migrateToCurrentVersion([{ type: "session", version: 2 } as SessionHeader, entry]);
+	if (entry.type === "message" && entry.message.role === "assistant") {
+		entry.message = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
+	}
+	repairTruncatedSnapcompactFrames(entry);
+	return entry;
 }
 
 /**
@@ -769,23 +925,48 @@ export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: Bl
 /**
  * Read-only transcript view of a session file: load entries, migrate to the
  * current version, resolve blob refs, and build the display transcript along
- * the persisted leaf path (last entry). Uses transcript mode (collapsed to the
+ * the replayed leaf path (including late usage's captured leaf). Uses transcript mode (collapsed to the
  * latest compaction) so failed/aborted tail turns stay visible, unlike the
  * provider-context builder which drops them. Does NOT create a writer or take
  * the session lock — safe to call against a file another session is writing.
  */
 export async function loadSessionMessagesReadOnly(filePath: string): Promise<AgentMessage[]> {
-	const entries = await loadEntriesFromFile(filePath);
-	if (entries.length === 0) return [];
-	migrateToCurrentVersion(entries);
-	for (const entry of entries) repairTruncatedSnapcompactFrames(entry);
 	const blobs = new BlobStore(getBlobsDir());
-	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
-	const { messages } = buildSessionContext(sessionEntries, undefined, undefined, {
-		transcript: true,
-		collapseCompactedHistory: true,
-		resolveFrameData: data => lazyImageDataSync(blobs, data),
+	const byId = new Map<string, PositionedSessionEntry>();
+	let leafId: string | null = null;
+	let lastSelfSelected: string | null = null;
+	const loaded = await visitSessionFileForResume(filePath, (entry, position) => {
+		byId.set(position.id, position);
+		leafId = sessionEntryLeafId(entry);
+		if (leafId === entry.id) lastSelfSelected = leafId;
 	});
+	if (leafId !== null && !byId.has(leafId)) leafId = lastSelfSelected;
+	let leaf = leafId === null ? undefined : byId.get(leafId);
+	if (loaded.invalidHeader || loaded.entries.length === 0 || loaded.sourceFd === undefined) return [];
+	const fd = loaded.sourceFd;
+	let messages: AgentMessage[];
+	try {
+		const path: PositionedSessionEntry[] = [];
+		const seen = new Set<string>();
+		while (leaf && !seen.has(leaf.id)) {
+			seen.add(leaf.id);
+			path.push(leaf);
+			leaf = leaf.parentId ? byId.get(leaf.parentId) : undefined;
+		}
+		const options = {
+			transcript: true,
+			collapseCompactedHistory: true,
+			resolveFrameData: (data: string) => lazyImageDataSync(blobs, data),
+		};
+		const selected = selectSessionContextEntriesFromLeafPath(
+			path,
+			id => readPositionedSessionEntry(fd, byId.get(id)!),
+			options,
+		);
+		({ messages } = buildSessionContextFromLeafPath(selected, options));
+	} finally {
+		fs.closeSync(fd);
+	}
 	// A collapsed summary carries the remote-compaction replacement history for
 	// provider replay only; this transcript is never replayed, and the renderer
 	// reads just the summary. Dropping it keeps hydration off every image blob

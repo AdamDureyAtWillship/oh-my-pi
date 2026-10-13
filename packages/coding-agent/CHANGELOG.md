@@ -932,6 +932,10 @@
 - Fixed isolated tasks failing on linked worktrees with initialized recursive submodules and leaving updated submodule pins unreachable after cleanup ([#15457](https://github.com/can1357/oh-my-pi/issues/15457))
 - Fixed `/tan` missing the parent's prompt cache by advertising `xd://` tools top-level and omitting `ask` ([#15578](https://github.com/can1357/oh-my-pi/issues/15578)).
 
+### Fixed
+
+- Fixed long-session resume retaining discarded history in memory while preserving context, history, tree navigation, exports, and persisted edits. Public session records remain directly cloneable; producers announce historical edits before persistence so they survive awaits and garbage collection ([#123](https://github.com/Komzpa/oh-my-pi/pull/123) by [@Komzpa](https://github.com/Komzpa)).
+
 ## [18.10.4] - 2026-10-13
 
 ### Added

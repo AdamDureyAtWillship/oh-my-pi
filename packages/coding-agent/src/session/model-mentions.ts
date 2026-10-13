@@ -18,7 +18,7 @@ import type { SessionManager } from "./session-manager";
 export const MODEL_MENTION_ENTRY_TYPE = "model_mention";
 
 /** Replay valid branch entries, keeping the first occurrence of each agent and selector. */
-export function readModelMentions(entries: readonly SessionEntry[]): ModelMention[] {
+export function readModelMentions(entries: Iterable<SessionEntry>): ModelMention[] {
 	const mentions: ModelMention[] = [];
 	const agents = new Set<string>();
 	const selectors = new Set<string>();
@@ -64,7 +64,7 @@ export class ModelMentionRegistry {
 
 	/** Rebuild pseudonyms after resume, rewind, or a session switch. */
 	syncFromBranch(): void {
-		this.#mentions = readModelMentions(this.#host.sessionManager.getBranch());
+		this.#mentions = readModelMentions(this.#host.sessionManager.iterateBranch("custom"));
 		this.#bySelector.clear();
 		this.#agents.clear();
 		for (const agent of this.#inheritedAgents) {

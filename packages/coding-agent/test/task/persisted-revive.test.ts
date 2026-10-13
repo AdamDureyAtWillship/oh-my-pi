@@ -34,7 +34,7 @@ import {
 	resolveRetryFallbackChainKey,
 } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import * as sessionLoader from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { createPersistedSubagentReviverFactory } from "@oh-my-pi/pi-coding-agent/task/persisted-revive";
 import { buildWakeRelayBody } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -1749,21 +1749,20 @@ describe("buildWakeRelayBody", () => {
 			// yet, so the reviver must fail closed on the fresh state instead
 			// of reviving stale history. Single-shot: only the snapshot read
 			// mutates, so the publish-time re-read observes the deletion.
-			const originalReadText = FileSessionStorage.prototype.readText;
-			const readTextSpy = vi.spyOn(FileSessionStorage.prototype, "readText").mockImplementationOnce(async function (
-				this: FileSessionStorage,
-				p: string,
-			) {
-				const text = await originalReadText.call(this, p);
-				await fs.promises.rm(p);
-				return text;
-			});
+			const originalVisit = sessionLoader.visitSessionFileForResume;
+			const snapshotSpy = vi
+				.spyOn(sessionLoader, "visitSessionFileForResume")
+				.mockImplementationOnce(async (filePath, visit, options) => {
+					const snapshot = await originalVisit(filePath, visit, options);
+					await fs.promises.rm(filePath);
+					return snapshot;
+				});
 			try {
 				await expect(reviver(ref)).rejects.toThrow(/ENOENT/);
 				// Fail closed without minting: the missing path stays missing.
 				expect(await Bun.file(sessionFile).exists()).toBe(false);
 			} finally {
-				readTextSpy.mockRestore();
+				snapshotSpy.mockRestore();
 			}
 		});
 

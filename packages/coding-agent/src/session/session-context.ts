@@ -150,13 +150,10 @@ export function getRestorableSessionModels(
 	return [roleModel, defaultModel];
 }
 
-export function getLatestCompactionEntry(entries: readonly SessionEntry[]): CompactionEntry | null {
-	for (let i = entries.length - 1; i >= 0; i--) {
-		if (entries[i].type === "compaction") {
-			return entries[i] as CompactionEntry;
-		}
-	}
-	return null;
+export function getLatestCompactionEntry(entries: Iterable<SessionEntry>): CompactionEntry | null {
+	let latest: CompactionEntry | null = null;
+	for (const entry of entries) if (entry.type === "compaction") latest = entry;
+	return latest;
 }
 
 export interface BuildSessionContextOptions {
@@ -237,6 +234,124 @@ export function isTranscriptEntry(entry: SessionEntry): entry is TranscriptEntry
 	return entry.type === "message" || entry.type === "custom_message";
 }
 
+/** Payload-free facts needed to select the model/display dependency closure. */
+export interface SessionContextEntryMetadata {
+	id: string;
+	parentId: string | null;
+	type: SessionEntry["type"];
+	messageRole?: string;
+	toolName?: string;
+	userRequest?: boolean;
+	customType?: string;
+	assistantProvider?: string;
+	assistantTimestamp?: number;
+	activeLeafId?: string | null;
+}
+
+export function sessionContextEntryMetadata(entry: SessionEntry): SessionContextEntryMetadata {
+	return {
+		id: entry.id,
+		parentId: entry.parentId,
+		type: entry.type,
+		messageRole: entry.type === "message" ? entry.message.role : undefined,
+		toolName: entry.type === "message" && entry.message.role === "toolResult" ? entry.message.toolName : undefined,
+		userRequest: isRolloverRequestEntry(entry),
+		customType: entry.type === "custom" ? entry.customType : undefined,
+		assistantProvider:
+			entry.type === "message" && entry.message.role === "assistant" ? entry.message.provider : undefined,
+		assistantTimestamp:
+			entry.type === "message" && entry.message.role === "assistant" ? entry.message.timestamp : undefined,
+		activeLeafId: entry.type === "model_usage" ? entry.activeLeafId : undefined,
+	};
+}
+
+/** Select leaf-to-root payloads before reading them; replay uses the canonical builder below. */
+export function selectSessionContextEntriesFromLeafPath(
+	path: readonly SessionContextEntryMetadata[],
+	read: (id: string) => SessionEntry,
+	options?: BuildSessionContextOptions,
+): SessionEntry[] {
+	if (options?.transcript && !options.collapseCompactedHistory) return path.map(entry => read(entry.id));
+	let compactionIdx = -1;
+	let resetIdx = -1;
+	for (let i = 0; i < path.length; i++) {
+		if (compactionIdx < 0 && path[i].type === "compaction") compactionIdx = i;
+		if (resetIdx < 0 && path[i].type === "reset_boundary") resetIdx = i;
+	}
+	const selected = new Set<string>();
+	const selectRange = (start: number, end: number) => {
+		for (let i = start; i < end; i++) selected.add(path[i].id);
+	};
+	if (resetIdx >= 0 && (compactionIdx < 0 || resetIdx < compactionIdx)) {
+		selectRange(0, resetIdx + 1);
+	} else if (compactionIdx >= 0) {
+		const compaction = read(path[compactionIdx].id) as CompactionEntry;
+		selectRange(0, compactionIdx + 1);
+		const keptIdx = path.findIndex((entry, i) => i > compactionIdx && entry.id === compaction.firstKeptEntryId);
+		const snapshotIdx = compaction.providerReplayThroughEntryId
+			? path.findIndex((entry, i) => i > compactionIdx && entry.id === compaction.providerReplayThroughEntryId)
+			: -1;
+		const remote = getOpenAiRemoteCompactionPayload(compaction);
+		const anthropic = getAnthropicCompactionPayload(compaction.preserveData);
+		if (!remote || options?.transcript) {
+			if (keptIdx >= 0) selectRange(compactionIdx + 1, keptIdx + 1);
+			else if (anthropic && compaction.firstKeptEntryId === "" && snapshotIdx >= 0)
+				selectRange(compactionIdx + 1, snapshotIdx + 1);
+		} else if (snapshotIdx >= 0) selectRange(compactionIdx + 1, snapshotIdx + 1);
+		// Active model-call usage includes metadata immediately before the kept
+		// message, up to (but not through) the previous transcript boundary.
+		if (keptIdx >= 0) {
+			for (let i = keptIdx + 1; i < path.length; i++) {
+				const entry = path[i];
+				if (["message", "custom_message", "branch_summary", "compaction", "reset_boundary"].includes(entry.type))
+					break;
+				if (entry.type === "model_usage") selected.add(entry.id);
+			}
+		}
+		if (isRecord(compaction.details) && compaction.details.kind === "experimental-context-rollover") {
+			for (let i = compactionIdx + 1; i < (resetIdx < 0 ? path.length : resetIdx); i++) {
+				if (path[i].userRequest) {
+					selected.add(path[i].id);
+					break;
+				}
+			}
+		}
+	} else selectRange(0, path.length);
+	// Settings precede the emission boundary. Keep one legacy model-inference
+	// assistant only when no explicit default model has superseded it.
+	let inferredAssistant: string | undefined;
+	let explicitDefault = false;
+	for (let i = path.length - 1; i >= 0; i--) {
+		const entry = path[i];
+		if (
+			["thinking_level_change", "model_change", "service_tier_change", "ttsr_injection", "mode_change"].includes(
+				entry.type,
+			)
+		) {
+			selected.add(entry.id);
+			if (entry.type === "model_change") {
+				const model = read(entry.id);
+				if (model.type === "model_change" && model.model && (model.role ?? "default") === "default")
+					explicitDefault = true;
+			}
+		} else if (!explicitDefault && entry.messageRole === "assistant") inferredAssistant = entry.id;
+	}
+	if (!explicitDefault && inferredAssistant) selected.add(inferredAssistant);
+	// The notebook may live before a compaction, but never before a reset.
+	for (let i = 0; i < (resetIdx < 0 ? path.length : resetIdx); i++) {
+		if (path[i].customType !== CONTEXT_NOTES_ENTRY_TYPE) continue;
+		const entry = read(path[i].id);
+		if (getContextNotes([entry])) {
+			selected.add(entry.id);
+			break;
+		}
+	}
+	// Keep the latest reset marker even when a later compaction wins, so notes
+	// and rollover request attribution retain their original lower bound.
+	if (resetIdx >= 0) selected.add(path[resetIdx].id);
+	return path.filter(entry => selected.has(entry.id)).map(entry => read(entry.id));
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -290,6 +405,14 @@ export function buildSessionContext(
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	return buildSessionContextFromLeafPath(path, options);
+}
+
+/** Build an already-selected leaf-to-root path, reversing it in place without re-walking historical parents. */
+export function buildSessionContextFromLeafPath(
+	path: SessionEntry[],
+	options?: BuildSessionContextOptions,
+): SessionContext {
 	path.reverse();
 
 	// Extract settings and find compaction

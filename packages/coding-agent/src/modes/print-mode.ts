@@ -196,7 +196,7 @@ async function runPrintModeCore(
 		cfgPlanDefaultOnStartup.get(session.settings) &&
 		cfgPlanEnabled.get(session.settings) &&
 		session.sessionManager.buildSessionContext().messages.length === 0 &&
-		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
+		!session.sessionManager.hasEntryType("mode_change") &&
 		!planYolo;
 	if (planStartupIgnored) {
 		process.stderr.write(

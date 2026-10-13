@@ -202,6 +202,81 @@ describe("async speculative compaction", () => {
 		authStorage.close();
 	});
 
+	for (const scenario of ["provider switch", "remote-to-soft fallback"]) {
+		it(`re-expands the remote boundary's original history after a ${scenario}`, async () => {
+			if (scenario === "remote-to-soft fallback") {
+				const bundled = getBundledModel("openai", "gpt-5");
+				if (!bundled) throw new Error("Expected built-in OpenAI model");
+				model = { ...bundled, contextWindow: CONTEXT_WINDOW };
+				authStorage.keys.setRuntime("openai", "test-key");
+			}
+			sessionManager.appendCompaction("Opaque remote placeholder", undefined, "", THRESHOLD, {
+				method: "remote",
+				preserveData: {
+					openaiRemoteCompaction: {
+						provider: "openai",
+						replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }],
+					},
+				},
+			});
+			sessionManager.appendMessage(userMessage("New request"));
+			sessionManager.appendMessage(assistantMessage("New response", model));
+			maintenance = createMaintenance({ asyncEnabled: false, methodOrder: ["soft"] });
+			const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+				summary: "Local summary of the original history",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			}));
+
+			await maintenance.compact();
+
+			expect(compactSpy).toHaveBeenCalledTimes(1);
+			expect(JSON.stringify(compactSpy.mock.calls[0][0].messagesToSummarize)).toContain("conversation ");
+			expect(compactSpy.mock.calls[0][0].previousSummary).toBeUndefined();
+		});
+	}
+
+	it("projects the current context's notebook across a gap before the kept tail", async () => {
+		sessionManager = SessionManager.inMemory();
+		sessionManager.appendModelChange(`${model.provider}/${model.id}`);
+		sessionManager.appendCustomEntry("experimental_context_notes", {
+			version: 1,
+			text: "durable notebook requirement ".repeat(400),
+		});
+		sessionManager.appendMessage(userMessage("Archived request"));
+		sessionManager.appendMessage(assistantMessage("Archived response", model));
+		const kept = sessionManager.appendMessage(userMessage("Retained request"));
+		sessionManager.appendMessage(assistantMessage("kept raw history ".repeat(8_000), model));
+		sessionManager.appendCompaction("Existing summary", undefined, kept, THRESHOLD);
+		sessionManager.appendMessage(userMessage("New request"));
+		const latest = assistantMessage("New response", model);
+		latest.usage = {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+		sessionManager.appendMessage(latest);
+		maintenance = createMaintenance({ asyncEnabled: false, methodOrder: ["soft"] });
+		const expected = agent.tokenizer.countMessages(convertToLlm(sessionManager.buildSessionContext().messages), {
+			excludeEncryptedReasoning: true,
+		});
+		vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "Short new summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+
+		await maintenance.runAutoCompaction("threshold", false);
+
+		const boundary = sessionManager.getEntries().findLast(entry => entry.type === "compaction");
+		expect(boundary?.type === "compaction" ? boundary.tokensBefore : undefined).toBe(expected);
+	});
+
 	it("reminds only near threshold once per experimental window, including the first and reset windows", async () => {
 		maintenance = createMaintenance({ experimental: true });
 		const network = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request"));
