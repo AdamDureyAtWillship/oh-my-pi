@@ -50,7 +50,7 @@ import type { IdleMaintenanceOptions } from "./idle-maintenance";
 import type { CustomMessage } from "./messages";
 import type { ServingModel } from "./retry-fallback-chains";
 import type { AdvisorStatusOverviewEntry } from "./session-advisors";
-import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
+import type { SessionContext, SessionContextEntryMetadata, TranscriptSessionContextOptions } from "./session-context";
 import type { ModelUsageEntry, SessionEntry, UsageStatistics } from "./session-entries";
 
 /** Session-manager reads other agents' code performs on a session it does not own. */
@@ -167,9 +167,11 @@ export interface AgentViewSessionManager extends AgentSessionManagerHandle {
 	getEntries(): SessionEntry[];
 	/** Entries from the root to `fromId` (default: the current leaf). */
 	getBranch(fromId?: string): SessionEntry[];
+	/** Active-branch entries whose metadata matches, read without materializing the rest of the branch. */
+	getBranchMatching(predicate: (metadata: SessionContextEntryMetadata) => boolean): SessionEntry[];
 	/** Id of the current leaf entry. */
 	getLeafId(): string | null;
-	/** The newest entry that moves the conversation, when the active branch ends at it (`conversationTip`). */
+	/** The newest entry that moves the conversation, when the active branch ends at it (`SessionEntryIndex.conversationTip`). */
 	getConversationTip(): SessionEntry | undefined;
 	/** Artifacts directory of the consulted seance source, when this is a seance session. */
 	getSeanceSourceArtifactsDir(): string | null;

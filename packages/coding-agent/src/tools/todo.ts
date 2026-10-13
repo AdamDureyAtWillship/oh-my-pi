@@ -13,6 +13,7 @@ import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
+import type { SessionContextEntryMetadata } from "../session/session-context";
 import type { SessionEntry } from "../session/session-entries";
 
 import { normalizePathLikeInput, resolveToCwd } from "./path-utils";
@@ -157,6 +158,13 @@ export function nextActionableTask(phases: readonly TodoPhase[]): TodoItem | und
 export const USER_TODO_EDIT_CUSTOM_TYPE = "user_todo_edit";
 
 export const TODO_HUD_STATE_CUSTOM_TYPE = "todo_hud_state";
+
+/** Entries that can carry todo state or HUD choices; replay over only these is equivalent to the full branch. */
+export function isTodoStateEntryMetadata(metadata: SessionContextEntryMetadata): boolean {
+	if (metadata.type === "custom")
+		return metadata.customType === USER_TODO_EDIT_CUSTOM_TYPE || metadata.customType === TODO_HUD_STATE_CUSTOM_TYPE;
+	return metadata.type === "message" && metadata.messageRole === "toolResult" && metadata.toolName === "todo";
+}
 
 export type TodoHudVisibility = "dismissed" | "revealed";
 

@@ -13,6 +13,7 @@ import type { SessionManager } from "./session-manager";
 
 import { cfgTaskBatch, cfgTaskEager } from "../task/settings";
 import { cfgTodoEager, cfgTodoEnabled, cfgTodoReminders, cfgTodoRemindersMax } from "../tools/settings";
+import { isTodoStateEntryMetadata } from "../tools/todo";
 
 const MID_RUN_NUDGE_MUTATION_THRESHOLD = 12;
 const MID_RUN_NUDGE_MAX_PER_CYCLE = 2;
@@ -116,7 +117,9 @@ export class TodoTracker {
 
 	/** Rehydrates todo phases from the current transcript branch. */
 	syncFromBranch(): void {
-		this.setPhases(getLatestTodoPhasesFromEntries(this.#host.sessionManager.getBranch()));
+		this.setPhases(
+			getLatestTodoPhasesFromEntries(this.#host.sessionManager.getBranchMatching(isTodoStateEntryMetadata)),
+		);
 	}
 
 	/** Returns a defensive clone suitable for snapshots and branch state. */

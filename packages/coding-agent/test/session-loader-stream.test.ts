@@ -438,6 +438,61 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 		expect(malformedRecords).toBe(1);
 	});
 
+	it("keeps only the first JSON value of a physical line that holds two values, then resumes on the next line", async () => {
+		const first = JSON.stringify(msg("p1", "s1", "first"));
+		const second = JSON.stringify(msg("p2", "p1", "second"));
+		const content = `${JSON.stringify(HEADER)}\n${first} ${second}\n${JSON.stringify(msg("tail", "s1", "after"))}\n`;
+		const file = await writeTemp(content);
+		const loaded = await sessionLoader.loadEntriesFromFileStream(file);
+
+		expect(entryIds(loaded.entries)).toEqual(["s1", "p1", "tail"]);
+		expect(loaded.malformedRecords).toBe(1);
+	});
+
+	it("recovers a valid prefix before trailing junk, honoring maxRecords without a malformed callback", async () => {
+		const content = `${JSON.stringify(msg("pre", "s1", "prefix"))} junk\n${JSON.stringify(msg("tail", "s1", "after"))}\n`;
+		const file = await writeTemp(content);
+		const loaded = await sessionLoader.loadEntriesFromFileStream(file);
+		expect(entryIds(loaded.entries)).toEqual(["pre", "tail"]);
+		expect(loaded.malformedRecords).toBe(1);
+
+		const capped: string[] = [];
+		let capMalformed = 0;
+		await sessionLoader.visitEntriesFromFileStream(file, entry => void capped.push(entry.id), {
+			maxRecords: 1,
+			onMalformedRecord: () => {
+				capMalformed++;
+			},
+		});
+		expect(capped).toEqual(["pre"]);
+		expect(capMalformed).toBe(0);
+	});
+
+	it("demands only the valid JSON prefix of a positioned entry and reads its exact Unicode value", async () => {
+		const text = "café 漢字 🙂";
+		const headerLine = `${JSON.stringify(HEADER)}\n`;
+		const preLine = JSON.stringify(msg("pre", "s1", text));
+		const file = await writeTemp(`${headerLine}${preLine} junk\n${JSON.stringify(msg("tail", "s1", "after"))}\n`);
+		const positions = new Map<string, Parameters<typeof sessionLoader.readPositionedSessionEntry>[1]>();
+		const resume = await sessionLoader.visitSessionFileForResume(file, (entry, position) => {
+			positions.set(entry.id, position);
+		});
+		try {
+			const position = positions.get("pre");
+			if (!position || resume.sourceFd === undefined) throw new Error("missing positioned entry or source fd");
+			expect(position.offset).toBe(Buffer.byteLength(headerLine));
+			expect(position.length).toBe(Buffer.byteLength(preLine));
+			expect(sessionLoader.readPositionedSessionEntry(resume.sourceFd, position)).toMatchObject({
+				type: "message",
+				id: "pre",
+				parentId: "s1",
+				message: { content: [{ type: "text", text }] },
+			});
+		} finally {
+			if (resume.sourceFd !== undefined) fs.closeSync(resume.sourceFd);
+		}
+	});
+
 	it("returns empty for a missing file (ENOENT)", async () => {
 		const missing = path.join(os.tmpdir(), `does-not-exist-${Date.now()}.jsonl`);
 		const stream = await sessionLoader.loadEntriesFromFileStream(missing);

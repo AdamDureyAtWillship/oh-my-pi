@@ -90,12 +90,13 @@ import type { CustomMessage } from "../session/messages";
 import { resolveRoleModelCycle, roleThinkingLevelForModel, serviceTierForModel } from "../session/model-controls";
 import type { ServingModel } from "../session/retry-fallback-chains";
 import {
-	buildSessionContext,
+	type BuildSessionContextOptions,
+	buildSessionContextFromLeafPath,
 	type SessionContext,
 	type TranscriptSessionContextOptions,
 } from "../session/session-context";
 import type { CustomEntry, SessionEntry } from "../session/session-entries";
-import { conversationTip, lastModelChangeRole, SessionEntryIndex } from "../session/session-manager";
+import { lastModelChangeRole, SessionEntryIndex } from "../session/session-manager";
 import type { AgentDefinition } from "../task/types";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
@@ -341,8 +342,13 @@ export class RemoteAgentSession implements AgentViewSession {
 			getSessionName: () => this.#view.sessionName,
 			getEntries: () => [...this.#entries],
 			getBranch: fromId => this.#entryIndex.pathTo(fromId),
+			getBranchMatching: predicate =>
+				this.#entryIndex
+					.metadataPath()
+					.filter(predicate)
+					.map(metadata => this.#entryIndex.get(metadata.id, false)!),
 			getLeafId: () => this.#entryIndex.leafId(),
-			getConversationTip: () => conversationTip(this.#entries, this.#entryIndex.branchView()),
+			getConversationTip: () => this.#entryIndex.conversationTip(),
 			getSeanceSourceArtifactsDir: () => this.#view.seanceSourceArtifactsDir,
 			appendCustomEntry: (customType, data) => this.#appendCustomEntry(customType, data),
 			flush: () => this.#command("flushSession"),
@@ -537,12 +543,13 @@ export class RemoteAgentSession implements AgentViewSession {
 	/** Display transcript built on main from the mirrored entries (already in display form) and leaf. */
 	buildTranscriptSessionContext(options?: TranscriptSessionContextOptions): SessionContext {
 		const keepLive = options?.keepInFlightToolCalls === true && this.#state.isStreaming;
-		return buildSessionContext(this.#entries, this.#entryIndex.leafId(), this.#entryIndex.entriesById(), {
+		const contextOptions: BuildSessionContextOptions = {
 			transcript: true,
 			collapseCompactedHistory: options?.collapseCompactedHistory,
 			inFlightToolCallIds: keepLive ? this.#runToolCallIds : undefined,
 			resolveFrameData: data => lazyImageDataSync(blobs(), data),
-		});
+		};
+		return buildSessionContextFromLeafPath(this.#entryIndex.contextLeafPath(contextOptions), contextOptions);
 	}
 
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined {

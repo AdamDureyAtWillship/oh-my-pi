@@ -161,6 +161,26 @@ export class ToolContextSessionView implements ReadonlySessionManager {
 		throw new CrossThreadSessionReadError("getBranch");
 	}
 
+	getContextBranch(): SessionEntry[] {
+		throw new CrossThreadSessionReadError("getContextBranch");
+	}
+
+	getEntryCount(): number {
+		throw new CrossThreadSessionReadError("getEntryCount");
+	}
+
+	hasEntryType(_type: SessionEntry["type"]): boolean {
+		throw new CrossThreadSessionReadError("hasEntryType");
+	}
+
+	iterateEntries(_type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
+		throw new CrossThreadSessionReadError("iterateEntries");
+	}
+
+	iterateBranch(_type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
+		throw new CrossThreadSessionReadError("iterateBranch");
+	}
+
 	getEntries(): SessionEntry[] {
 		throw new CrossThreadSessionReadError("getEntries");
 	}

@@ -1789,8 +1789,15 @@ describe("AgentSession auto-compaction progress guard", () => {
 				? { tokens: 1000, contextWindow: 200000, percent: 0.5 }
 				: { tokens: 190000, contextWindow: 200000, percent: 95 },
 		);
+		const updateEntry = vi.spyOn(sessionManager, "updateEntry");
 		const shakeSpy = vi.spyOn(session, "shake").mockImplementation(async () => {
 			shaken = true;
+			const tail = sessionManager.getContextBranch().findLast(entry => entry.type === "message");
+			if (tail?.type !== "message" || tail.message.role !== "assistant")
+				throw new Error("Expected a retained assistant");
+			tail.message.content = [];
+			sessionManager.updateEntry(tail);
+			compactionModule.invalidateMessageCache(tail.message);
 			return { mode: "elide", toolResultsDropped: 1, blocksDropped: 0, tokensFreed: 160000, artifactId: "art-1" };
 		});
 
@@ -1815,6 +1822,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const recovery = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes("dead-end recovery"));
 		expect(recovery.length).toBe(1);
 		expect(recovery[0].level).toBe("info");
+		expect(updateEntry.mock.calls.filter(([entry]) => entry.type === "compaction")).toHaveLength(1);
 	});
 
 	it("still warns when a shake rescue cannot free the irreducible tail", async () => {

@@ -16,6 +16,7 @@ import {
 	describePendingToolCalls,
 	hasRestorableTurn,
 	SESSION_EXIT_CUSTOM_TYPE,
+	type SessionExitData,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
@@ -128,17 +129,18 @@ describe("session exit diagnostics", () => {
 			.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
 		await reopened.close();
 		if (exitEntry?.type !== "custom") throw new Error("Expected session exit marker");
-		expect(exitEntry.data).toMatchObject({
-			reason: "dispose",
-			kind: "normal",
-			pendingToolCalls: [
-				{
-					toolCallId: "toolu_repro",
-					toolName: "bash",
-					args: { command: "bun run check:ts" },
-				},
-			],
-		});
+		const exit = exitEntry.data as SessionExitData;
+		expect(exit.reason).toBe("dispose");
+		expect(exit.kind).toBe("normal");
+		expect(exit.pendingToolCalls?.length).toBe(1);
+		const exitPending = exit.pendingToolCalls?.[0];
+		if (!exitPending) throw new Error("Expected pending tool diagnostic");
+		expect(exitPending.toolCallId).toBe("toolu_repro");
+		expect(exitPending.toolName).toBe("bash");
+		if (exitPending.args === null || typeof exitPending.args !== "object" || !("command" in exitPending.args)) {
+			throw new Error("Expected pending command arguments");
+		}
+		expect(exitPending.args.command).toBe("bun run check:ts");
 	});
 
 	it("signal teardown persists the postmortem reason, not the generic dispose", async () => {
