@@ -111,6 +111,7 @@ import {
 	resolveRoleModelFull,
 } from "./role-models";
 import type { SessionContext } from "./session-context";
+import { getPruningBranch } from "./pruning-branch";
 import {
 	buildSessionContextFromLeafPath,
 	getLatestCompactionEntry,
@@ -723,7 +724,7 @@ export class SessionMaintenance {
 	}
 
 	async #pruneToolOutputs(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
-		const branchEntries = this.#host.sessionManager.getContextBranch();
+		const branchEntries = getPruningBranch(this.#host.sessionManager);
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
 		const model = this.#host.model();
 		const result = pruneToolOutputs(
@@ -770,7 +771,7 @@ export class SessionMaintenance {
 	async #pruneStaleToolResults(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
 		const { supersedeReads, dropUseless } = this.#compactionSettings;
 		if (!supersedeReads && !dropUseless) return undefined;
-		const branchEntries = this.#host.sessionManager.getContextBranch();
+		const branchEntries = getPruningBranch(this.#host.sessionManager);
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
 		const model = this.#host.model();
 		const result = pruneSupersededToolResults(
