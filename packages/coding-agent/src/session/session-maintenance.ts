@@ -2533,8 +2533,7 @@ export class SessionMaintenance {
 			method: armed.method,
 			providerReplayThroughEntryId:
 				armed.result.providerReplayThroughEntryId ??
-				(isRecord(armed.result.preserveData?.openaiRemoteCompaction) ||
-				(nativeAnthropic && hasLaterEntries)
+				(isRecord(armed.result.preserveData?.openaiRemoteCompaction) || (nativeAnthropic && hasLaterEntries)
 					? armed.snapshotLeafId
 					: undefined),
 		});

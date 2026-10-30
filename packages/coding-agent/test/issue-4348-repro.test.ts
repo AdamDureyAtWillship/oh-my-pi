@@ -77,7 +77,7 @@ function makeRenderCtx(transcript: SessionContext): { ctx: InteractiveModeContex
 			hasBuiltInTool: () => true,
 			extensionRunner: undefined,
 			sessionManager: {
-				getEntries: vi.fn(() => []),
+				getEntryCount: vi.fn(() => 0),
 				getCwd: vi.fn(() => "/tmp"),
 			},
 		},

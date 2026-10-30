@@ -78,7 +78,6 @@ import {
 	validateRetryFallbackChains,
 } from "./retry-fallback-chains";
 import { describeUsageFallback } from "./retry-fallback-reason";
-import { getLatestCompactionEntry } from "./session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE, type SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { isUserQueuedMessage } from "./queued-messages";
@@ -1335,7 +1334,7 @@ export class TurnRecovery {
 		assistantMessage: AssistantMessage,
 		options: { autoContinue: boolean; triggerContextTokens?: number; excludeMediaMethods?: boolean },
 	): Promise<RecoveryCompactionResult> {
-		const compactionEntryBefore = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
+		const compactionIdBefore = this.#host.sessionManager.getLatestCompactionEntry()?.id;
 		await this.dropPersistedAssistantTurn(assistantMessage);
 		const result = await this.#host.runAutoCompaction(reason, true, {
 			autoContinue: options.autoContinue,
@@ -1343,8 +1342,8 @@ export class TurnRecovery {
 			phase: "mid_turn",
 			excludeMediaMethods: options.excludeMediaMethods,
 		});
-		const compactionEntryAfter = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
-		if (result.historyRewritten !== true && compactionEntryAfter === compactionEntryBefore) {
+		const compactionIdAfter = this.#host.sessionManager.getLatestCompactionEntry()?.id;
+		if (result.historyRewritten !== true && compactionIdAfter === compactionIdBefore) {
 			this.#restoreFailedAssistantTurn(assistantMessage);
 		}
 		return result;

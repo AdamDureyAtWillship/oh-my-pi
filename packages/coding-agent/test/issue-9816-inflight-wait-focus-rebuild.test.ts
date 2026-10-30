@@ -245,7 +245,8 @@ function makeSession(
 		hasBuiltInTool: () => true,
 		sessionManager: {
 			getCwd: () => process.cwd(),
-			getEntries: () => messages,
+			// The transcript holds no compaction.
+			getEntryCount: (type?: string) => (type ? 0 : messages.length),
 		},
 	};
 

@@ -11,6 +11,8 @@
  * scrollback-clearing repaint (`clearTerminalHistory`).
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
@@ -22,6 +24,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext, RenderSessionContextOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { SessionContext, StrippedToolCallsMarker } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type Component, Container, Image, ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -86,7 +89,7 @@ function makeCtx(): RenderInitialMessagesTestContext {
 			hasBuiltInTool: () => true,
 			sessionManager: {
 				buildSessionContext: llmContextSpy,
-				getEntries: vi.fn(() => []),
+				getEntryCount: vi.fn(() => 0),
 				getCwd: vi.fn(() => "/tmp"),
 			},
 		},
@@ -196,7 +199,7 @@ function makeRenderCtx(
 			hasBuiltInTool: () => true,
 			extensionRunner: undefined,
 			sessionManager: {
-				getEntries: vi.fn(() => []),
+				getEntryCount: vi.fn(() => 0),
 				getCwd: vi.fn(() => "/tmp"),
 				putBlobSync: vi.fn(() => ({
 					hash: "hash",
@@ -714,6 +717,78 @@ describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
 	});
 });
 
+describe("UiHelpers.renderInitialMessages — compacted history", () => {
+	it("replays a reopened compacted session without reading the entries before its compaction", async () => {
+		using dir = TempDir.createSync("@pi-render-initial-compacted-");
+		const timestamp = "2026-01-01T00:00:00.000Z";
+		const header = { type: "session", version: 3, id: "render-compacted", timestamp, cwd: dir.path() };
+		const entries: SessionEntry[] = [
+			{
+				type: "message",
+				id: "old",
+				parentId: null,
+				timestamp,
+				message: { role: "user", content: "old request", timestamp: 1 },
+			},
+			{
+				type: "message",
+				id: "kept",
+				parentId: "old",
+				timestamp,
+				message: { role: "user", content: "kept request", timestamp: 2 },
+			},
+			{
+				type: "compaction",
+				id: "c1",
+				parentId: "kept",
+				timestamp,
+				firstKeptEntryId: "kept",
+				summary: "summary",
+				tokensBefore: 1000,
+			},
+			{
+				type: "message",
+				id: "tail",
+				parentId: "c1",
+				timestamp,
+				message: { role: "user", content: "tail request", timestamp: 3 },
+			},
+		];
+		const file = path.join(dir.path(), "session.jsonl");
+		await Bun.write(file, `${[header, ...entries].map(entry => JSON.stringify(entry)).join("\n")}\n`);
+		const session = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+		try {
+			// Blank the entry before the compaction in the journal, so reading it back fails.
+			const fd = fs.openSync(file, "r+");
+			try {
+				let offset = Buffer.byteLength(`${JSON.stringify(header)}\n`);
+				for (const entry of entries) {
+					const length = Buffer.byteLength(JSON.stringify(entry));
+					if (entry.id === "old") fs.writeSync(fd, Buffer.alloc(length, " "), 0, length, offset);
+					offset += length + 1;
+				}
+			} finally {
+				fs.closeSync(fd);
+			}
+			Bun.gc(true);
+			const transcript = session.buildSessionContext({ transcript: true, collapseCompactedHistory: true });
+			const { ctx, chatContainer } = makeRenderCtx(transcript);
+			// The real reopened session replaces the stub's session manager.
+			const view: { sessionManager: unknown } = ctx.viewSession;
+			view.sessionManager = session;
+
+			await new UiHelpers(ctx).renderInitialMessages();
+
+			const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
+			expect(rendered).toContain("tail request");
+			expect(rendered).not.toContain("old request");
+			expect(ctx.showStatus).toHaveBeenCalledWith("Session compacted 1 time");
+		} finally {
+			await session.close();
+		}
+	});
+});
+
 describe("UiHelpers.renderSessionContext — error-stop tool calls", () => {
 	it("keeps the synthetic assistant error result instead of replaying a later tool result", async () => {
 		await Settings.init({ inMemory: true });
@@ -797,17 +872,13 @@ describe("UiHelpers.renderSessionContext — mid-stream tool call rebuild", () =
 });
 
 describe("UiHelpers.renderInitialMessages — replay convergence (issue #7811)", () => {
-	/** getEntries mock whose returned array grows on every call, simulating a
-	 * source that persists a new session entry during every replay pass. */
+	/** Entry-count mock that grows on every call, simulating a source that
+	 * persists a new session entry during every replay pass. */
 	function growingEntriesCtx(): RenderInitialMessagesTestContext {
 		const made = makeCtx();
 		let calls = 0;
-		const getEntries = vi.fn(() => {
-			calls++;
-			return Array.from({ length: calls }, () => ({ type: "message" }));
-		});
-		(made.ctx.viewSession.sessionManager as unknown as { getEntries: unknown }).getEntries = getEntries;
-		(made.ctx.sessionManager as unknown as { getEntries: unknown }).getEntries = getEntries;
+		const viewManager: { getEntryCount?: unknown } = made.ctx.viewSession.sessionManager;
+		viewManager.getEntryCount = vi.fn(() => ++calls);
 		return made;
 	}
 
@@ -835,13 +906,8 @@ describe("UiHelpers.renderInitialMessages — replay convergence (issue #7811)",
 		const { ctx, transcriptSpy } = makeCtx();
 		const lengths = [0, 1, 1, 1, 1, 1, 1, 1];
 		let call = 0;
-		const getEntries = vi.fn(() => {
-			const length = lengths[Math.min(call, lengths.length - 1)]!;
-			call++;
-			return Array.from({ length }, () => ({ type: "message" }));
-		});
-		(ctx.viewSession.sessionManager as unknown as { getEntries: unknown }).getEntries = getEntries;
-		(ctx.sessionManager as unknown as { getEntries: unknown }).getEntries = getEntries;
+		const viewManager: { getEntryCount?: unknown } = ctx.viewSession.sessionManager;
+		viewManager.getEntryCount = vi.fn(() => lengths[Math.min(call++, lengths.length - 1)]!);
 
 		await new UiHelpers(ctx).renderInitialMessages();
 

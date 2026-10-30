@@ -137,7 +137,9 @@ function createHarness(): Harness {
 		session: sessionMock,
 		viewSession: {
 			buildTranscriptSessionContext: () => buildSessionContext(entries),
-			sessionManager: { getEntries: () => entries },
+			sessionManager: {
+				getEntryCount: (type?: string) => entries.filter(entry => !type || entry.type === type).length,
+			},
 		},
 		focusedAgentId: undefined,
 		sessionManager: {

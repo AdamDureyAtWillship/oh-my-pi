@@ -46,7 +46,7 @@ describe("/handoff command", () => {
 		const requestRender = vi.fn();
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: {
 				handoff: vi.fn(async () => {
@@ -100,7 +100,7 @@ describe("/handoff command", () => {
 		let loadingAnimation: { stop: () => void } | undefined;
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: {
 				isStreaming: false,
@@ -152,7 +152,7 @@ describe("/handoff command", () => {
 		let loaderAtEnsureCall: { stop: () => void } | undefined | "unset" = "unset";
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: {
 				get isStreaming() {
@@ -216,7 +216,7 @@ describe("/handoff command", () => {
 		const ensureLoadingAnimation = vi.fn();
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: {
 				get isStreaming() {
@@ -273,7 +273,7 @@ describe("/handoff command", () => {
 		const statusContainer = createContainer();
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: {
 				handoff: vi.fn(async () => {
@@ -309,7 +309,7 @@ describe("/handoff command", () => {
 		const statusContainer = createContainer();
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: { isStreaming: true, handoff },
 			loadingAnimation: undefined,
@@ -339,7 +339,7 @@ describe("/handoff command", () => {
 		const showWarning = vi.fn();
 		const ctx = {
 			sessionManager: {
-				getEntries: () => [{ type: "message" }, { type: "message" }],
+				getEntryCount: () => 2,
 			},
 			session: { isStreaming: false, isCompacting: true, handoff },
 			loadingAnimation: undefined,

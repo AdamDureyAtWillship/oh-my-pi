@@ -53,7 +53,7 @@ function createInitialRenderHarness(): { ctx: InteractiveModeContext; helpers: U
 			buildTranscriptSessionContext: () => buildSessionContext([]),
 			sessionManager: {
 				buildSessionContext: () => buildSessionContext([]),
-				getEntries: () => [],
+				getEntryCount: () => 0,
 			},
 		},
 		get viewSession() {
