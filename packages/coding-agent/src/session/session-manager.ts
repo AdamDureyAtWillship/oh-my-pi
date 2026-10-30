@@ -532,6 +532,8 @@ interface IndexedSessionEntry extends Omit<PositionedSessionEntry, "offset" | "l
 	entry?: SessionEntry;
 	weak?: WeakRef<SessionEntry>;
 	revision?: number;
+	/** The update sequence number of the latest announced update. */
+	updated?: number;
 }
 
 /** The provider and collapsed-display selections for one leaf, root first. */
@@ -604,9 +606,11 @@ const readerRegistry = new FinalizationRegistry<number>(fd => {
 	}
 });
 
-// Entry-graph revisions come from one sequence, so an index that replaces
-// another never repeats a revision a memo was anchored on.
+// Entry-graph revisions and update sequence numbers each come from one
+// sequence, so an index that replaces another never repeats a value a memo
+// was anchored on.
 let lastGraphRevision = 0;
+let lastEntryUpdate = 0;
 
 /** Journal-wide facts and byte ranges; only selected context payloads are retained. */
 class SessionEntryIndex {
@@ -638,6 +642,8 @@ class SessionEntryIndex {
 	// Changes whenever the entry graph is rewritten (a clear or rebuild, or a
 	// moved parent), never on an append or a leaf move.
 	#graphRevision = ++lastGraphRevision;
+	// The sequence number of the latest update() announced here.
+	#updateSequence = lastEntryUpdate;
 	#read?: (entry: IndexedSessionEntry) => SessionEntry;
 	#readerFd?: number;
 	#readerPath?: string;
@@ -962,6 +968,15 @@ class SessionEntryIndex {
 		}
 		return undefined;
 	}
+	/** The current-branch records whose latest announced update is newer than `sequence`, oldest first. */
+	branchUpdatedAfter(sequence: number): IndexedSessionEntry[] {
+		if (sequence >= this.#updateSequence) return [];
+		return this.#leafPath().filter(record => (record.updated ?? 0) > sequence);
+	}
+	/** See {@link SessionManager.updateSequence}. */
+	updateSequence(): number {
+		return this.#updateSequence;
+	}
 	/** The newest current-branch entry whose metadata matches; no other entry is read. */
 	latestOnBranch(predicate: (metadata: SessionContextEntryMetadata) => boolean): SessionEntry | undefined {
 		const path = this.#leafPath();
@@ -1049,6 +1064,7 @@ class SessionEntryIndex {
 		indexed.entry = entry;
 		this.#retained.add(indexed);
 		indexed.revision = (indexed.revision ?? 0) + 1;
+		this.#updateSequence = indexed.updated = ++lastEntryUpdate;
 		this.#refreshRecord(indexed, entry);
 		// The selections also read payload fields outside the metadata (a
 		// compaction's kept range and kind, a model change's role) and hold the
@@ -4427,6 +4443,25 @@ export class SessionManager {
 			record => index.get(record.id, false)!,
 			type,
 			options,
+		);
+	}
+
+	/**
+	 * Advances whenever an edit is announced through {@link updateEntry}. A
+	 * memo of what the branch's payloads say reads the entries edited since
+	 * with {@link iterateBranchUpdatedAfter}.
+	 */
+	get updateSequence(): number {
+		return this.#index.updateSequence();
+	}
+
+	/** Current-branch entries whose latest edit was announced after `sequence`, a value of {@link updateSequence}, in path order. */
+	iterateBranchUpdatedAfter(sequence: number, type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
+		const index = this.#index;
+		return readEach(
+			() => index.branchUpdatedAfter(sequence),
+			record => index.get(record.id, false)!,
+			type,
 		);
 	}
 

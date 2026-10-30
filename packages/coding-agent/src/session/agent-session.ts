@@ -444,7 +444,7 @@ import {
 	SessionAdvisors,
 	type SessionAdvisorsHost,
 } from "./session-advisors";
-import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
+import type { SessionContext, SessionContextEntryMetadata, TranscriptSessionContextOptions } from "./session-context";
 import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
 import type { CacheWarmer, CacheWarmingMode, CacheWarmingStatus, PromptCacheEntry } from "./cache-warmer";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
@@ -456,7 +456,7 @@ import {
 	type SessionDumpLiveState,
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import type { BranchSummaryEntry, NewSessionOptions, SessionEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -874,6 +874,31 @@ function isEvalActivity(message: AgentMessage): boolean {
 	);
 }
 
+/**
+ * The persistence keys of the message entries on one session file's branch up
+ * to `leafId`, at `graphRevision`, with the edits announced up to
+ * `updateSequence`. A key an edit replaced stays: a message that has it only
+ * takes the slow content check.
+ */
+interface PersistedMessageKeys {
+	sessionFile: string | undefined;
+	graphRevision: number;
+	leafId: string | null;
+	updateSequence: number;
+	keys: Set<string>;
+	keysAreExact: boolean;
+}
+
+/** Add the persistence key of each message entry in `entries` to `keys`. */
+function addPersistedMessageKeys(keys: Set<string>, entries: Iterable<SessionEntry>): Set<string> {
+	for (const entry of entries) {
+		if (entry.type !== "message") continue;
+		const key = sessionMessagePersistenceKey(entry.message);
+		if (key !== undefined) keys.add(key);
+	}
+	return keys;
+}
+
 /** A retry supersedes a failed operation only when its intent matches, allowing a missing append phase to be supplied. */
 function todoRetryMatches(failed: Record<string, unknown>, retry: Record<string, unknown>): boolean {
 	if (Bun.deepEquals(failed, retry)) return true;
@@ -1130,7 +1155,7 @@ export class AgentSession implements SettingsScope {
 	#turnIndex = 0;
 	#messageEndPersistenceTail: Promise<void> = Promise.resolve();
 	#pendingMessageEndPersistence = new Map<string, Promise<void>>();
-	#persistedMessageKeys: { anchor: string; keys: Set<string> } | undefined;
+	#persistedMessageKeys: PersistedMessageKeys | undefined;
 
 	// Custom commands (TypeScript slash commands)
 	#customCommands: LoadedCustomCommand[] = [];
@@ -4046,9 +4071,12 @@ export class AgentSession implements SettingsScope {
 	 *
 	 * Coherency is anchor-based, not invalidation-based: every branch mutation
 	 * (rewind, branch switch, new session, custom-entry append) changes the
-	 * session manager's leaf id or session file, so `#ensurePersistedMessageKeys`
-	 * detects staleness itself and rebuilds. No mutation call site has to
-	 * remember to invalidate anything.
+	 * session manager's leaf id or session file, and every rewrite of its entry
+	 * graph (a durable discard, a rolled-back batch) its graph revision, so
+	 * `#ensurePersistedMessageKeys` detects staleness itself. While the graph is
+	 * unchanged and the anchor's leaf is still on the branch, only the entries
+	 * appended after it are read; otherwise the set is rebuilt. No mutation
+	 * call site has to remember to invalidate anything.
 	 *
 	 * Pre-#3629 the equivalent was `sessionManager.getBranch()` called twice
 	 * per turn message, each call rebuilding the path via O(n²) `unshift` and
@@ -4057,31 +4085,65 @@ export class AgentSession implements SettingsScope {
 	 * `ui.loop-blocked` warnings in the bug report.
 	 */
 	#indexPersistedMessageKeys(): Set<string> {
-		return this.#ensurePersistedMessageKeys();
-	}
-
-	#persistedMessageKeysAnchor(): string {
-		return `${this.sessionManager.getSessionFile() ?? ""}\u0000${this.sessionManager.getLeafId() ?? ""}`;
-	}
-
-	#ensurePersistedMessageKeys(): Set<string> {
-		const anchor = this.#persistedMessageKeysAnchor();
-		let cache = this.#persistedMessageKeys;
-		if (cache === undefined || cache.anchor !== anchor) {
-			cache = { anchor, keys: this.#buildPersistedMessageKeySet() };
-			this.#persistedMessageKeys = cache;
+		this.#ensurePersistedMessageKeys();
+		const cache = this.#persistedMessageKeys!;
+		if (!cache.keysAreExact) {
+			// Ordinary duplicate checks validate key hits against current entries,
+			// but the mid-run planner requires exact logical membership after edits.
+			cache.keys = addPersistedMessageKeys(new Set(), this.sessionManager.iterateBranch("message"));
+			cache.keysAreExact = true;
 		}
 		return cache.keys;
 	}
 
-	#buildPersistedMessageKeySet(): Set<string> {
-		const keys = new Set<string>();
-		for (const entry of this.sessionManager.iterateBranch("message")) {
-			if (entry.type !== "message") continue;
-			const key = sessionMessagePersistenceKey(entry.message);
-			if (key !== undefined) keys.add(key);
+	#persistedMessageKeysAreCurrent(cache: PersistedMessageKeys): boolean {
+		return (
+			cache.sessionFile === this.sessionManager.getSessionFile() &&
+			cache.graphRevision === this.sessionManager.graphRevision &&
+			cache.leafId === this.sessionManager.getLeafId() &&
+			cache.updateSequence === this.sessionManager.updateSequence
+		);
+	}
+
+	#ensurePersistedMessageKeys(): Set<string> {
+		const sessionFile = this.sessionManager.getSessionFile();
+		const graphRevision = this.sessionManager.graphRevision;
+		const leafId = this.sessionManager.getLeafId();
+		const updateSequence = this.sessionManager.updateSequence;
+		let cache = this.#persistedMessageKeys;
+		if (cache && (cache.sessionFile !== sessionFile || cache.graphRevision !== graphRevision)) cache = undefined;
+		if (cache && cache.leafId !== leafId) {
+			// Appends since (tool starts, custom entries, model changes) only add
+			// keys; a rewind or branch switch leaves the anchor's leaf behind.
+			const appended = this.sessionManager.iterateBranchAfter(cache.leafId, "message");
+			if (appended) {
+				addPersistedMessageKeys(cache.keys, appended);
+				cache.leafId = leafId;
+			} else {
+				cache = undefined;
+			}
 		}
-		return keys;
+		if (cache && cache.updateSequence !== updateSequence) {
+			// An edited message can carry another key (a retimed or re-attributed message).
+			addPersistedMessageKeys(
+				cache.keys,
+				this.sessionManager.iterateBranchUpdatedAfter(cache.updateSequence, "message"),
+			);
+			cache.updateSequence = updateSequence;
+			cache.keysAreExact = false;
+		}
+		if (!cache) {
+			cache = {
+				sessionFile,
+				graphRevision,
+				leafId,
+				updateSequence,
+				keys: addPersistedMessageKeys(new Set(), this.sessionManager.iterateBranch("message")),
+				keysAreExact: true,
+			};
+			this.#persistedMessageKeys = cache;
+		}
+		return cache.keys;
 	}
 
 	/**
@@ -4105,7 +4167,12 @@ export class AgentSession implements SettingsScope {
 		if (key === undefined) return false;
 		const keys = this.#ensurePersistedMessageKeys();
 		if (!keys.has(key)) return false;
-		for (const entry of this.sessionManager.iterateBranch("message")) {
+		// A re-persisted message is almost always the newest with its key, and
+		// only a message of its role (a reply with its timestamp) can share it.
+		const sharesKey = (metadata: SessionContextEntryMetadata) =>
+			metadata.messageRole === message.role &&
+			(message.role !== "assistant" || metadata.assistantTimestamp === message.timestamp);
+		for (const entry of this.sessionManager.iterateBranch("message", { newestFirst: true, matching: sharesKey })) {
 			if (entry.type !== "message") continue;
 			if (sessionMessagePersistenceKey(entry.message) !== key) continue;
 			if (!sameMessageContent(entry.message, message)) continue;
@@ -4131,7 +4198,7 @@ export class AgentSession implements SettingsScope {
 			| FileMentionMessage,
 	): string {
 		const cache = this.#persistedMessageKeys;
-		const wasFresh = cache !== undefined && cache.anchor === this.#persistedMessageKeysAnchor();
+		const wasFresh = cache !== undefined && this.#persistedMessageKeysAreCurrent(cache);
 		// A digest entry carries no persistence key, so the memo stays valid across it.
 		if (message.role === "assistant") this.#tools.recordReplyPrompt(message);
 		const entryId = this.sessionManager.appendMessage(message);
@@ -4141,7 +4208,7 @@ export class AgentSession implements SettingsScope {
 		const key = sessionMessagePersistenceKey(message);
 		if (wasFresh && cache && key) {
 			cache.keys.add(key);
-			cache.anchor = this.#persistedMessageKeysAnchor();
+			cache.leafId = this.sessionManager.getLeafId();
 		}
 		return entryId;
 	}
@@ -4801,8 +4868,11 @@ export class AgentSession implements SettingsScope {
 					// transient reminder entry follows it (last-entry would branch-cut the
 					// reminder instead of leaving it on the active path).
 					let checkpointEntryId: string | null = null;
-					for (const entry of this.sessionManager.iterateEntries("message")) {
-						if (entry.type === "message" && entry.message === event.message) checkpointEntryId = entry.id;
+					for (const entry of this.sessionManager.iterateEntries("message", { newestFirst: true })) {
+						if (entry.type === "message" && entry.message === event.message) {
+							checkpointEntryId = entry.id;
+							break;
+						}
 					}
 					if (this.#checkpointState) {
 						this.#checkpointState.checkpointEntryId = checkpointEntryId;
