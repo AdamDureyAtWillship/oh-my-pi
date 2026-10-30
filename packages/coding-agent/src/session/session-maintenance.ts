@@ -1716,11 +1716,10 @@ export class SessionMaintenance {
 
 	/** Opaque remote summaries require the original history when preparation cannot reuse them. */
 	#branchForCompactionPreparation(settings: EngineCompactionSettings, model: Model | undefined): SessionEntry[] {
-		const branch = this.#host.sessionManager.getContextBranch();
-		const latest = getLatestCompactionEntry(branch);
+		const latest = this.#host.sessionManager.getLatestCompactionEntry();
 		return latest && model && !remotePreserveReusable(latest.preserveData, model, settings)
 			? this.#host.sessionManager.getBranch()
-			: branch;
+			: this.#host.sessionManager.getContextBranch();
 	}
 
 	/**

@@ -21,6 +21,7 @@ import {
 	type ToolExecutionStartData,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -48,6 +49,12 @@ const pendingAssistant: AssistantMessage = {
 	stopReason: "toolUse",
 	timestamp: Date.now(),
 };
+
+/** Fail if a diagnostic asks for any payload older than the supplied root-first suffix. */
+function* newestTailOnly(tail: readonly SessionEntry[]): IterableIterator<SessionEntry> {
+	for (let index = tail.length - 1; index >= 0; index--) yield tail[index]!;
+	throw new Error("Diagnostic iterated an old tool-result payload");
+}
 
 describe("session exit diagnostics", () => {
 	let session: AgentSession | undefined;
@@ -281,6 +288,219 @@ describe("session exit diagnostics", () => {
 
 		expect(collectPendingToolCalls(sessionManager.getBranch())).toEqual([]);
 		expect(describePendingToolCalls(sessionManager.getBranch())).toBeUndefined();
+	});
+
+	it("matches interrupted-turn diagnostics for root-first arrays, generators and newest-first branches", () => {
+		const sessionManager = SessionManager.inMemory();
+		const fallback = { api: pendingAssistant.api, provider: "selected-provider", model: "selected-model" };
+		const assertParity = () => {
+			for (const model of [undefined, fallback]) {
+				const expected = createInterruptedTurnAbortMessage(sessionManager.getBranch(), model);
+				expect(createInterruptedTurnAbortMessage(sessionManager.iterateBranch(), model)).toEqual(expected);
+				expect(
+					createInterruptedTurnAbortMessage(
+						sessionManager.iterateBranch(undefined, { newestFirst: true }),
+						model,
+						{ newestFirst: true },
+					),
+				).toEqual(expected);
+			}
+		};
+		assertParity();
+		sessionManager.appendMessage({ role: "user", content: "first prompt", timestamp: 1 });
+		assertParity();
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "exit",
+			kind: "process_exit",
+			recordedAt: "2026-07-11T02:20:08.800Z",
+		});
+		assertParity(); // First-turn fallback, or no model yet.
+		sessionManager.appendMessage(pendingAssistant);
+		assertParity(); // The exit is now older than the tail.
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			content: [{ type: "text", text: "partial result" }],
+			isError: false,
+			timestamp: 2,
+		});
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "signal",
+			kind: "signal",
+			recordedAt: "2026-07-11T02:20:09.800Z",
+		});
+		assertParity(); // Previous assistant metadata wins over the fallback.
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, { kind: "invalid" });
+		assertParity(); // A malformed newer marker does not supersede a valid exit.
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: "2026-07-11T02:20:10.800Z",
+			pendingToolCalls: "malformed",
+		});
+		assertParity();
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: "2026-07-11T02:20:11.800Z",
+			pendingToolCalls: [{ toolCallId: "toolu_repro", toolName: "bash" }],
+		});
+		assertParity();
+		for (const stopReason of ["stop", "error", "aborted"] as const) {
+			sessionManager.appendMessage({ ...pendingAssistant, stopReason });
+			sessionManager.appendMessage({
+				role: "toolResult",
+				toolCallId: "toolu_repro",
+				toolName: "bash",
+				content: [{ type: "text", text: "result" }],
+				isError: true,
+				timestamp: 3,
+			});
+			sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+				reason: "exit",
+				kind: "process_exit",
+				recordedAt: "2026-07-11T02:20:12.800Z",
+			});
+			assertParity();
+		}
+		sessionManager.appendMessage({ ...pendingAssistant, content: [{ type: "text", text: "done" }] });
+		assertParity();
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "fatal",
+			kind: "fatal",
+			recordedAt: "2026-07-11T02:20:13.800Z",
+		});
+		assertParity(); // An abnormal exit cannot reopen a terminal assistant tail.
+	});
+
+	it("matches assumed-exit recovery for newest-first tails without a following exit", () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage(pendingAssistant);
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: "2026-07-11T02:20:08.800Z",
+		});
+		sessionManager.appendMessage({ role: "user", content: "new turn", timestamp: 2 });
+		const before = Date.now();
+		const expected = createInterruptedTurnAbortMessage(sessionManager.getBranch(), undefined, { assumeExit: true });
+		const recovered = createInterruptedTurnAbortMessage(
+			sessionManager.iterateBranch(undefined, { newestFirst: true }),
+			undefined,
+			{ assumeExit: true, newestFirst: true },
+		);
+		expect(expected).toBeDefined();
+		expect(recovered).toEqual({ ...expected!, timestamp: expect.any(Number) });
+		expect(recovered!.timestamp).toBeGreaterThanOrEqual(before);
+		expect(recovered!.timestamp).toBeLessThanOrEqual(Date.now());
+	});
+
+	it("stops interrupted-turn scans once the newest exit, tail and model are sufficient", () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage(pendingAssistant);
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			content: [{ type: "text", text: "partial result" }],
+			isError: false,
+			timestamp: 2,
+		});
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "signal",
+			kind: "signal",
+			recordedAt: "2026-07-11T02:20:08.800Z",
+		});
+		const tail = sessionManager.getBranch();
+		expect(createInterruptedTurnAbortMessage(newestTailOnly(tail), undefined, { newestFirst: true })).toEqual(
+			createInterruptedTurnAbortMessage(tail),
+		);
+
+		sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: "2026-07-11T02:20:09.800Z",
+		});
+		// A clean exit needs neither the last tool result nor any older assistant.
+		expect(
+			createInterruptedTurnAbortMessage(newestTailOnly(sessionManager.getBranch().slice(-1)), undefined, {
+				newestFirst: true,
+			}),
+		).toBeUndefined();
+		for (const message of [
+			{ ...pendingAssistant, content: [{ type: "text" as const, text: "done" }] },
+			{ role: "user" as const, content: "new turn", timestamp: 3 },
+		]) {
+			sessionManager.appendMessage(message);
+			// No exit follows this tail, so older exits and model payloads are irrelevant.
+			expect(
+				createInterruptedTurnAbortMessage(newestTailOnly(sessionManager.getBranch().slice(-1)), undefined, {
+					newestFirst: true,
+				}),
+			).toBeUndefined();
+		}
+	});
+
+	it("preserves pending-call marker, result and insertion order when scanning newest-first", () => {
+		const sessionManager = SessionManager.inMemory();
+		const assertParity = () => {
+			const branch = sessionManager.getBranch();
+			const expected = collectPendingToolCalls(branch);
+			expect(collectPendingToolCalls(sessionManager.iterateBranch())).toEqual(expected);
+			expect(
+				collectPendingToolCalls(sessionManager.iterateBranch(undefined, { newestFirst: true }), {
+					newestFirst: true,
+				}),
+			).toEqual(expected);
+			expect(
+				describePendingToolCalls(sessionManager.iterateBranch(undefined, { newestFirst: true }), {
+					newestFirst: true,
+				}),
+			).toEqual(describePendingToolCalls(branch));
+		};
+		sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+			toolCallId: "orphan",
+			toolName: "read",
+			args: { path: "old.txt" },
+			startedAt: "2026-07-11T02:20:00.000Z",
+		});
+		assertParity(); // Marker-only legacy branches have no assistant boundary.
+		sessionManager.appendMessage(pendingAssistant);
+		const assistantTailStart = sessionManager.getBranch().length - 1;
+		assertParity(); // The new assistant clears older pending markers.
+		for (const toolCallId of ["toolu_repro", "extra", "toolu_repro"]) {
+			sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, {
+				toolCallId,
+				toolName: "bash",
+				args: { command: "marker summary" },
+				intent: `run ${toolCallId}`,
+				startedAt: "2026-07-11T02:20:01.000Z",
+			});
+			assertParity();
+		}
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: 2,
+		});
+		sessionManager.appendMessage({ role: "user", content: "continue", timestamp: 3 });
+		assertParity(); // User messages do not clear pending calls.
+		const tail = sessionManager.getBranch().slice(assistantTailStart);
+		expect(collectPendingToolCalls(newestTailOnly(tail), { newestFirst: true })).toEqual(
+			collectPendingToolCalls(tail),
+		);
+		expect(describePendingToolCalls(newestTailOnly(tail), { newestFirst: true })).toEqual(
+			describePendingToolCalls(tail),
+		);
+		sessionManager.appendMessage({ ...pendingAssistant, content: [{ type: "text", text: "done" }] });
+		assertParity();
+		expect(
+			describePendingToolCalls(newestTailOnly(sessionManager.getBranch().slice(-1)), { newestFirst: true }),
+		).toBeUndefined();
 	});
 
 	it("reconstructs an abnormal process-exit tail as one terminal aborted assistant message", () => {

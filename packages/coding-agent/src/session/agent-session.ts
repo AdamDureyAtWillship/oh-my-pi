@@ -13195,11 +13195,11 @@ export class AgentSession implements SettingsScope {
 
 			const model = this.model;
 			if (model) {
-				const interruptedTurnAbort = createInterruptedTurnAbortMessage(this.sessionManager.iterateBranch(), {
-					api: model.api,
-					provider: model.provider,
-					model: model.id,
-				});
+				const interruptedTurnAbort = createInterruptedTurnAbortMessage(
+					this.sessionManager.iterateBranch(undefined, { newestFirst: true }),
+					{ api: model.api, provider: model.provider, model: model.id },
+					{ newestFirst: true },
+				);
 				if (interruptedTurnAbort) {
 					this.sessionManager.appendMessage(interruptedTurnAbort);
 					sessionContext = this.buildDisplaySessionContext();

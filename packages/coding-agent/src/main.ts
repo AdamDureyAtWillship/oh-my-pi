@@ -2313,7 +2313,10 @@ export async function runRootCommand(
 			else process.stderr.write(`${chalk.yellow(notice)}\n`);
 		}
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {
-			const pendingToolWarning = describePendingToolCalls(sessionManager.iterateBranch());
+			const pendingToolWarning = describePendingToolCalls(
+				sessionManager.iterateBranch(undefined, { newestFirst: true }),
+				{ newestFirst: true },
+			);
 			if (pendingToolWarning) {
 				logger.warn("Resumed session has pending tool calls", {
 					sessionId: sessionManager.getSessionId(),

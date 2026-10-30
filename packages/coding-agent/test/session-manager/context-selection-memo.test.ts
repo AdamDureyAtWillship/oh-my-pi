@@ -9,7 +9,11 @@ import {
 	selectSessionContextEntriesFromLeafPath,
 	sessionContextEntryMetadata,
 } from "@oh-my-pi/pi-coding-agent/session/session-context";
-import type { ModelUsageEntry, SessionMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type {
+	ModelUsageEntry,
+	SessionEntry,
+	SessionMessageEntry,
+} from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { makeAssistantMessage } from "./helpers";
@@ -163,6 +167,78 @@ describe("SessionManager context selection memo", () => {
 		const session = SessionManager.create(dir.path(), dir.path());
 		try {
 			await appendEveryKind(session);
+		} finally {
+			await session.close();
+		}
+	});
+
+	it("changes the graph revision when the entry graph is rewritten, and only then", async () => {
+		using dir = TempDir.createSync("@context-graph-revision-");
+		const session = SessionManager.create(dir.path(), dir.path());
+		try {
+			const first = session.appendMessage(user("first"));
+			const discarded = session.appendMessage(reply());
+			const tier = session.appendServiceTierChange(null);
+			const unchanged = session.graphRevision;
+			session.appendCustomEntry("probe");
+			session.branch(first);
+			session.branch(tier);
+			expect(session.graphRevision).toBe(unchanged);
+
+			// Recovery's discard moves the tier change onto `first`; a memo anchored
+			// on the tier change still finds its anchor on the branch.
+			await session.discardEntryDurably(discarded);
+			expect(session.getBranch().map(entry => entry.id)).not.toContain(discarded);
+			expect(session.iterateBranchAfter(tier)).toBeDefined();
+			const discardedRevision = session.graphRevision;
+			expect(discardedRevision).not.toBe(unchanged);
+
+			const moved = session.getEntry(tier);
+			if (!moved) throw new Error("Missing tier change");
+			moved.parentId = null;
+			session.updateEntry(moved);
+			expect(session.graphRevision).not.toBe(discardedRevision);
+		} finally {
+			await session.close();
+		}
+	});
+
+	it("moves a held entry edited onto another parent in its branch, children and graph revision", async () => {
+		const session = SessionManager.inMemory();
+		try {
+			const first = session.appendMessage(user("first"));
+			const probe = session.appendCustomEntry("probe");
+			const last = session.appendMessage(user("last"));
+			const ids = (entries: readonly SessionEntry[]) => entries.map(entry => entry.id);
+			expect(ids(session.getBranch())).toEqual([first, probe, last]);
+			const unchanged = session.graphRevision;
+
+			const relabelled = session.getEntry(probe);
+			if (relabelled?.type !== "custom") throw new Error("Missing probe entry");
+			relabelled.customType = "relabelled";
+			expect(session.graphRevision).toBe(unchanged);
+
+			// Edited in place, then announced: either way the entry has moved once.
+			const tail = session.getEntry(last);
+			if (!tail) throw new Error("Missing tail");
+			tail.parentId = first;
+			for (const step of ["edited in place", "announced"]) {
+				expect({
+					step,
+					branch: ids(session.getBranch()),
+					underFirst: ids(session.getChildren(first)),
+					underProbe: ids(session.getChildren(probe)),
+				}).toEqual({ step, branch: [first, last], underFirst: [probe, last], underProbe: [] });
+				session.updateEntry(tail);
+			}
+			const moved = session.graphRevision;
+			expect(moved).not.toBe(unchanged);
+
+			// A replacement object takes the old one's place on the branch.
+			const replacement = { ...tail };
+			session.updateEntry(replacement);
+			expect(session.getBranch().at(-1)).toBe(replacement);
+			expect(session.graphRevision).toBe(moved);
 		} finally {
 			await session.close();
 		}

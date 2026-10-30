@@ -108,6 +108,8 @@ export interface InterruptedTurnOptions {
 	 * crash, SIGKILL or power loss records none): `omp --restore` says so.
 	 */
 	assumeExit?: boolean;
+	/** Consume a newest-first branch, stopping once its exit, tail and model are known. */
+	newestFirst?: boolean;
 }
 
 /** A turn its process left unfinished: the branch's last message and when the process ended. */
@@ -133,22 +135,36 @@ function findUnfinishedTurn(
 	let tailIndex = -1;
 	let tail: AgentMessage | undefined;
 	let previousAssistant: AssistantMessage | undefined;
+	const newestFirst = options?.newestFirst;
 	let index = 0;
 	for (const entry of entries) {
 		const candidate = readSessionExit(entry);
-		if (candidate) {
+		if (candidate && (!newestFirst || !exit)) {
 			exitIndex = index;
 			exit = candidate;
+			if (newestFirst && !tail && exit.kind === "normal" && !exit.pendingToolCalls?.length) {
+				return undefined;
+			}
 		}
 		if (entry.type === "message") {
-			tailIndex = index;
-			tail = entry.message;
-			if (entry.message.role === "assistant") previousAssistant = entry.message;
+			if (!newestFirst || !tail) {
+				tailIndex = index;
+				tail = entry.message;
+				if (newestFirst) {
+					// Any exit not seen yet is older than this tail and cannot close it.
+					if (!exit && !options?.assumeExit) return undefined;
+					if (tail.role === "assistant" && !tail.content.some(isToolCallContent)) return undefined;
+				}
+			}
+			if (entry.message.role === "assistant" && (!newestFirst || !previousAssistant)) {
+				previousAssistant = entry.message;
+			}
 		}
+		if (newestFirst && tail && previousAssistant) break;
 		index++;
 	}
 	if (!tail) return undefined;
-	if (!exit || tailIndex > exitIndex) {
+	if (!exit || (newestFirst ? tailIndex < exitIndex : tailIndex > exitIndex)) {
 		if (!options?.assumeExit) return undefined;
 		exit = { reason: "restore", kind: "process_exit", recordedAt: new Date().toISOString() };
 	} else if (exit.kind === "normal" && !exit.pendingToolCalls?.length) {
@@ -388,8 +404,23 @@ function applyMessageEntry(pending: Map<string, PendingToolCallRecord>, message:
 	appendAssistantToolCalls(pending, message);
 }
 
-/** Finds tool calls left pending at the end of a session branch. */
-export function collectPendingToolCalls(entries: Iterable<SessionEntry>): PendingToolCallDiagnostic[] {
+/**
+ * Finds tool calls left pending at the end of a session branch. With newest-first
+ * input, only the suffix through the last assistant is needed: it resets pending
+ * calls, and replaying that suffix preserves marker/result order and diagnostics.
+ */
+export function collectPendingToolCalls(
+	entries: Iterable<SessionEntry>,
+	options?: { newestFirst?: boolean },
+): PendingToolCallDiagnostic[] {
+	if (options?.newestFirst) {
+		const tail: SessionEntry[] = [];
+		for (const entry of entries) {
+			tail.push(entry);
+			if (entry.type === "message" && entry.message.role === "assistant") break;
+		}
+		entries = tail.reverse();
+	}
 	const pending = new Map<string, PendingToolCallRecord>();
 	for (const entry of entries) {
 		if (entry.type === "message") {
@@ -421,8 +452,11 @@ function formatPendingToolCall(call: PendingToolCallDiagnostic): string {
 }
 
 /** Builds the resume warning shown when a prior branch ended mid-tool-call. */
-export function describePendingToolCalls(entries: Iterable<SessionEntry>): string | undefined {
-	const pending = collectPendingToolCalls(entries);
+export function describePendingToolCalls(
+	entries: Iterable<SessionEntry>,
+	options?: { newestFirst?: boolean },
+): string | undefined {
+	const pending = collectPendingToolCalls(entries, options);
 	if (pending.length === 0) return undefined;
 	const formatted = pending.map(formatPendingToolCall).join(", ");
 	const noun = pending.length === 1 ? "tool call" : "tool calls";

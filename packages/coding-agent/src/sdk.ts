@@ -2032,7 +2032,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// evidence that the old process can no longer finish that turn. Preserve the
 	// partial transcript and append one terminal aborted assistant record before
 	// rebuilding runtime context. The helper is idempotent once that record exists.
-	const interruptedTurnAbort = createInterruptedTurnAbortMessage(sessionManager.iterateBranch());
+	const interruptedTurnAbort = createInterruptedTurnAbortMessage(
+		sessionManager.iterateBranch(undefined, { newestFirst: true }),
+		undefined,
+		{ newestFirst: true },
+	);
 	if (interruptedTurnAbort) {
 		for (const result of createInterruptedToolResults(sessionManager.iterateBranch()))
 			sessionManager.appendMessage(result);
@@ -3528,11 +3532,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// has selected its final model, use that model to terminate the
 		// interrupted turn before the live agent consumes the restored context.
 		if (model) {
-			const selectedModelAbort = createInterruptedTurnAbortMessage(sessionManager.iterateBranch(), {
-				api: model.api,
-				provider: model.provider,
-				model: model.id,
-			});
+			const selectedModelAbort = createInterruptedTurnAbortMessage(
+				sessionManager.iterateBranch(undefined, { newestFirst: true }),
+				{ api: model.api, provider: model.provider, model: model.id },
+				{ newestFirst: true },
+			);
 			if (selectedModelAbort) {
 				for (const result of createInterruptedToolResults(sessionManager.iterateBranch()))
 					sessionManager.appendMessage(result);
