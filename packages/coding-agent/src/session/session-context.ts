@@ -329,11 +329,7 @@ export function selectSessionContextEntriesFromLeafPath(
 			)
 		) {
 			selected.add(entry.id);
-			if (entry.type === "model_change") {
-				const model = read(entry.id);
-				if (model.type === "model_change" && model.model && (model.role ?? "default") === "default")
-					explicitDefault = true;
-			}
+			if (entry.type === "model_change" && isExplicitDefaultModelChange(read(entry.id))) explicitDefault = true;
 		} else if (!explicitDefault && entry.messageRole === "assistant") inferredAssistant = entry.id;
 	}
 	if (!explicitDefault && inferredAssistant) selected.add(inferredAssistant);
@@ -350,6 +346,35 @@ export function selectSessionContextEntriesFromLeafPath(
 	// and rollover request attribution retain their original lower bound.
 	if (resetIdx >= 0) selected.add(path[resetIdx].id);
 	return path.filter(entry => selected.has(entry.id)).map(entry => read(entry.id));
+}
+
+/** A model change that names the default model, superseding the model inferred from an assistant. */
+export function isExplicitDefaultModelChange(entry: SessionEntry): boolean {
+	return entry.type === "model_change" && Boolean(entry.model) && (entry.role ?? "default") === "default";
+}
+
+/**
+ * Whether appending `entry` at the leaf only adds it to both selections of
+ * {@link selectSessionContextEntriesFromLeafPath}, so a memoized selection can
+ * be extended in place. Every entry from the leaf back to the newest boundary
+ * is selected, so the new leaf always is; it changes what else is selected
+ * only when it is a boundary, a model change, a notebook, or (while
+ * `inferredModel`: no explicit default model change is on the path) a newer
+ * assistant to infer the model from. Keep this in step with that function.
+ */
+export function leafAppendExtendsContextSelection(entry: SessionEntry, inferredModel: boolean): boolean {
+	switch (entry.type) {
+		case "compaction":
+		case "reset_boundary":
+		case "model_change":
+			return false;
+		case "custom":
+			return entry.customType !== CONTEXT_NOTES_ENTRY_TYPE;
+		case "message":
+			return !inferredModel || entry.message.role !== "assistant";
+		default:
+			return true;
+	}
 }
 
 export function buildSessionContext(

@@ -47,6 +47,8 @@ import type { RetryFallbackRole } from "./retry-fallback-chains";
 import {
 	type BuildSessionContextOptions,
 	buildSessionContextFromLeafPath,
+	isExplicitDefaultModelChange,
+	leafAppendExtendsContextSelection,
 	selectSessionContextEntriesFromLeafPath,
 	type SessionContextEntryMetadata,
 	sessionContextEntryMetadata,
@@ -532,6 +534,36 @@ interface IndexedSessionEntry extends Omit<PositionedSessionEntry, "offset" | "l
 	revision?: number;
 }
 
+/** The provider and collapsed-display selections for one leaf, root first. */
+interface SelectedContext {
+	generation: number;
+	leaf: string | null;
+	provider: SessionEntry[];
+	display: SessionEntry[];
+	/** No explicit default model change is on the path, so the newest assistant stands in for one. */
+	inferredModel: boolean;
+}
+
+type MetadataEdit = "parent" | "metadata";
+
+/** Copy `entry`'s metadata into its index record, reporting whether it moved the entry or changed anything else. */
+function refreshIndexedMetadata(indexed: IndexedSessionEntry, entry: SessionEntry): MetadataEdit | undefined {
+	const metadata = sessionContextEntryMetadata(entry);
+	const firstKeptEntryId = entry.type === "compaction" ? entry.firstKeptEntryId : undefined;
+	let edit: MetadataEdit | undefined = firstKeptEntryId === indexed.firstKeptEntryId ? undefined : "metadata";
+	for (const key in metadata) {
+		const field = key as keyof SessionContextEntryMetadata;
+		if (indexed[field] === metadata[field]) continue;
+		if (field === "parentId") edit = "parent";
+		else edit ??= "metadata";
+	}
+	if (edit) {
+		Object.assign(indexed, metadata);
+		indexed.firstKeptEntryId = firstKeptEntryId;
+	}
+	return edit;
+}
+
 // A caller retaining a context payload also retains its plain owning entry;
 // historical reads and branch arrays themselves are only weakly memoized.
 const readerRegistry = new FinalizationRegistry<number>(fd => {
@@ -555,8 +587,20 @@ class SessionEntryIndex {
 	// leaf appends to the issued view in O(1); a leaf change or rebuild starts
 	// a fresh array. Weak ownership lets dropped historical views be collected.
 	#generation = 0;
-	#metadataCache: { generation: number; leaf: string | null | undefined; path: IndexedSessionEntry[] } | undefined;
 	#branchCache: { leaf: string | null; generation: number; branch: WeakRef<SessionEntry[]> } | undefined;
+	// The metadata path (root first) and the provider and collapsed-display
+	// selections drawn from it are extended in place the same way, so an
+	// append needs no leaf-to-root walk or reselection. Before either memo is
+	// reused, in-place edits of the payloads the index holds are copied into
+	// their metadata (any such edit drops the selections), so a read costs time
+	// in the selection and the records still holding their payload, not in the
+	// branch. Storage that never writes payloads keeps every record holding
+	// its own, so there a read still costs time in the whole session.
+	#metadataCache: { generation: number; leaf: string | null | undefined; path: IndexedSessionEntry[] } | undefined;
+	#contextCache: SelectedContext | undefined;
+	// Records holding their own payload: appends not yet written and announced
+	// updates. A record leaves on the first refresh after its payload is written.
+	#retained = new Set<IndexedSessionEntry>();
 	#read?: (entry: IndexedSessionEntry) => SessionEntry;
 	#readerFd?: number;
 	#readerPath?: string;
@@ -564,6 +608,8 @@ class SessionEntryIndex {
 
 	clear(closeReader = true): void {
 		this.#metadataCache = undefined;
+		this.#contextCache = undefined;
+		this.#retained.clear();
 		this.#entriesById.clear();
 		this.#ordered = [];
 		this.#children.clear();
@@ -631,27 +677,63 @@ class SessionEntryIndex {
 		};
 		this.#ordered.push(indexed);
 		this.#entriesById.set(entry.id, indexed);
+		if (indexed.entry) this.#retained.add(indexed);
 		// Late usage is physically last but replays to the leaf captured at append time.
 		const nextLeaf = sessionEntryLeafId(entry);
 		this.#leaf = nextLeaf;
 		this.#generation++;
+		const extendsLeaf = isNew && nextLeaf === entry.id && entry.parentId === previousLeaf && entry.parentId !== null;
 		const cache = this.#branchCache;
 		const branch = cache?.branch.deref();
 		if (
-			isNew &&
-			nextLeaf === entry.id &&
+			extendsLeaf &&
 			cache !== undefined &&
 			branch !== undefined &&
 			cache.generation === this.#generation - 1 &&
-			cache.leaf === previousLeaf &&
-			entry.parentId === previousLeaf &&
-			entry.parentId !== null
+			cache.leaf === previousLeaf
 		) {
 			branch.push(entry);
 			cache.leaf = entry.id;
 			cache.generation = this.#generation;
 		} else {
 			this.#branchCache = undefined;
+		}
+		const metadata = this.#metadataCache;
+		const pathCurrent =
+			metadata !== undefined && metadata.generation === this.#generation - 1 && metadata.leaf === previousLeaf;
+		// A new off-branch entry (late usage) leaves the leaf, and so its path, as
+		// it was, unless it is the leaf itself (a dangling leaf arriving) or the
+		// missing parent the path's root points at.
+		const keepsPath =
+			isNew &&
+			nextLeaf === previousLeaf &&
+			nextLeaf !== entry.id &&
+			pathCurrent &&
+			metadata.path[0]?.parentId !== entry.id;
+		if ((extendsLeaf || keepsPath) && pathCurrent) {
+			if (extendsLeaf) {
+				metadata.path.push(indexed);
+				metadata.leaf = entry.id;
+			}
+			metadata.generation = this.#generation;
+		} else {
+			this.#metadataCache = undefined;
+		}
+		const context = this.#contextCache;
+		if (
+			(keepsPath || (extendsLeaf && leafAppendExtendsContextSelection(entry, context?.inferredModel ?? true))) &&
+			context?.generation === this.#generation - 1 &&
+			context.leaf === previousLeaf
+		) {
+			if (extendsLeaf) {
+				context.provider.push(entry);
+				context.display.push(entry);
+				context.leaf = entry.id;
+				this.#active.set(entry.id, entry);
+			}
+			context.generation = this.#generation;
+		} else {
+			this.#contextCache = undefined;
 		}
 		const bucket = this.#children.get(entry.parentId);
 		if (bucket) bucket.push(entry.id);
@@ -713,6 +795,7 @@ class SessionEntryIndex {
 		this.#active.clear();
 		this.#generation++;
 		this.#branchCache = undefined;
+		this.#contextCache = undefined;
 	}
 
 	/** Stop extending an issued view when the next append's leaf move will be undone. */
@@ -745,6 +828,7 @@ class SessionEntryIndex {
 
 	/** The memoized active-leaf branch, without copying. Callers MUST NOT mutate it. */
 	branchView(): readonly SessionEntry[] {
+		this.#refreshRetained();
 		const cache = this.#branchCache;
 		const retained = cache?.branch.deref();
 		if (cache?.generation === this.#generation && retained) return retained;
@@ -753,52 +837,78 @@ class SessionEntryIndex {
 		return branch;
 	}
 
-	#metadataLeafPath(id: string | null | undefined = this.#leaf): IndexedSessionEntry[] {
-		const cache = this.#metadataCache;
-		if (cache?.generation === this.#generation && cache.leaf === id) {
-			let valid = true;
-			for (let i = 0; i < cache.path.length; i++) {
-				const current = cache.path[i]!;
-				const retained = this.retainedEntry(current.id);
-				if (retained) {
-					Object.assign(current, sessionContextEntryMetadata(retained));
-					if (retained.type === "compaction") current.firstKeptEntryId = retained.firstKeptEntryId;
-				}
-				if (i + 1 < cache.path.length && current.parentId !== cache.path[i + 1]!.id) valid = false;
-				if (i + 1 === cache.path.length && current.parentId !== null) valid = false;
-			}
-			if (valid) return cache.path.slice();
+	/**
+	 * Copy in-place edits of the payloads the index holds (the selections and
+	 * records not yet written) into their metadata, as a full walk once did on
+	 * every read. A historical payload read back from disk is a copy: its edits
+	 * reach the index, and the file, through update().
+	 */
+	#refreshRetained(): void {
+		for (const [id, payload] of this.#active) {
+			const indexed = this.#entriesById.get(id);
+			if (indexed) this.#refreshRecord(indexed, indexed.entry ?? payload);
 		}
+		for (const indexed of this.#retained) {
+			if (!indexed.entry) this.#retained.delete(indexed);
+			else if (!this.#active.has(indexed.id)) this.#refreshRecord(indexed, indexed.entry);
+		}
+	}
+
+	/**
+	 * Copy `entry`'s metadata into its record. Any change drops the
+	 * selections; a moved parent also moves the entry among its new parent's
+	 * children, in file order as a reload lists them, and starts every memo of
+	 * the graph again.
+	 */
+	#refreshRecord(indexed: IndexedSessionEntry, entry: SessionEntry): void {
+		const parentId = indexed.parentId;
+		const edit = refreshIndexedMetadata(indexed, entry);
+		if (!edit) return;
+		this.#contextCache = undefined;
+		if (edit !== "parent") return;
+		const siblings = this.#children.get(parentId);
+		const at = siblings ? siblings.indexOf(indexed.id) : -1;
+		if (at >= 0) siblings!.splice(at, 1);
+		const children: string[] = [];
+		for (const record of this.#ordered) if (record.parentId === indexed.parentId) children.push(record.id);
+		this.#children.set(indexed.parentId, children);
+		this.#generation++;
+	}
+
+	/** The root-first metadata path to `id`, memoized for the leaf the context is built from. Callers MUST NOT mutate it. */
+	#leafPath(id: string | null = this.#leaf): IndexedSessionEntry[] {
+		this.#refreshRetained();
+		const memoized = id === this.contextLeafId();
+		const cache = this.#metadataCache;
+		if (memoized && cache?.generation === this.#generation && cache.leaf === id) return cache.path;
 		const path: IndexedSessionEntry[] = [];
 		// A corrupt cyclic parent chain stops at the FIRST repeated id, even
 		// when unrelated entries inflate the index beyond that cycle's length.
 		const seen = new Set<string>();
 		let current = id ? this.#entriesById.get(id) : undefined;
 		while (current && !seen.has(current.id)) {
-			const retained = this.retainedEntry(current.id);
-			if (retained) {
-				Object.assign(current, sessionContextEntryMetadata(retained));
-				if (retained.type === "compaction") current.firstKeptEntryId = retained.firstKeptEntryId;
-			}
 			seen.add(current.id);
 			path.push(current);
 			current = current.parentId ? this.#entriesById.get(current.parentId) : undefined;
 		}
-		this.#metadataCache = { generation: this.#generation, leaf: id, path: path.slice() };
+		path.reverse();
+		// Explicit walks to other entries are rare and bypass the memo.
+		if (memoized) this.#metadataCache = { generation: this.#generation, leaf: id, path };
 		return path;
 	}
 	metadataPath(id: string | null | undefined = this.#leaf): IndexedSessionEntry[] {
-		return this.#metadataLeafPath(id).reverse();
+		return this.#leafPath(id).slice();
 	}
 	/**
 	 * The leaf a context is built from: the current leaf or, while that is
 	 * unavailable (an off-branch entry naming a rolled-back leaf, or one a
 	 * replica has not received yet), the leaf replay selects, as the canonical
-	 * builder resolves it. Its context's payloads are the ones held.
+	 * builder resolves it. The selections are memoized for this leaf.
 	 */
 	contextLeafId(): string | null {
 		const leaf = this.#leaf;
 		if (leaf === null || this.#entriesById.has(leaf)) return leaf;
+		this.#refreshRetained();
 		// resolveSessionLeafId(), looking ids up in the index.
 		const last = this.#ordered.at(-1);
 		if (!last) return null;
@@ -807,43 +917,72 @@ class SessionEntryIndex {
 	}
 	/** The context entries of `leaf`, by default the leaf the context is built from, leaf first. */
 	contextLeafPath(options?: BuildSessionContextOptions, leaf: string | null = this.contextLeafId()): SessionEntry[] {
-		const path = this.#metadataLeafPath(leaf);
-		const entries = selectSessionContextEntriesFromLeafPath(path, id => this.get(id)!, options);
-		if (leaf === this.contextLeafId() && (!options?.transcript || options.collapseCompactedHistory)) {
-			// Retain both provider and collapsed-display dependencies of the current
-			// leaf, never the full transcript requested by an export or historical
-			// navigation, nor the context of another leaf.
-			const display = selectSessionContextEntriesFromLeafPath(path, id => this.get(id)!, {
-				transcript: true,
-				collapseCompactedHistory: true,
-			});
-			const provider = options?.transcript
-				? selectSessionContextEntriesFromLeafPath(path, id => this.get(id)!)
-				: entries;
-			this.#active = new Map([...provider, ...display].map(entry => [entry.id, entry]));
+		// The full transcript an export or historical navigation asks for is neither memoized nor retained.
+		if (options?.transcript && !options.collapseCompactedHistory) {
+			return this.#leafPath(leaf)
+				.map(entry => this.get(entry.id)!)
+				.reverse();
 		}
-		return entries;
+		// Nor is the context of another leaf.
+		if (leaf !== this.contextLeafId()) {
+			const leafFirst = this.#leafPath(leaf).slice().reverse();
+			return selectSessionContextEntriesFromLeafPath(leafFirst, id => this.get(id)!, options);
+		}
+		const context = this.#selectedContext();
+		return (options?.transcript ? context.display : context.provider).slice().reverse();
+	}
+	/** The current leaf's ordered provider/display union; all payloads are already retained. */
+	contextBranch(): SessionEntry[] {
+		if (this.#leaf !== this.contextLeafId()) return [];
+		this.#selectedContext();
+		return [...this.#active.values()];
+	}
+	/** The provider and collapsed-display selections for the context's leaf, which are the retained payloads. */
+	#selectedContext(): SelectedContext {
+		const leaf = this.contextLeafId();
+		const path = this.#leafPath(leaf);
+		const cache = this.#contextCache;
+		if (cache?.generation === this.#generation && cache.leaf === leaf) return cache;
+		const leafFirst = path.slice().reverse();
+		const read = (id: string) => this.get(id)!;
+		const provider = selectSessionContextEntriesFromLeafPath(leafFirst, read).reverse();
+		const display = selectSessionContextEntriesFromLeafPath(leafFirst, read, {
+			transcript: true,
+			collapseCompactedHistory: true,
+		}).reverse();
+		this.#active = new Map([...provider, ...display].map(entry => [entry.id, entry]));
+		// Both selections are subsequences of this path, but their concatenation
+		// is not ordered. Order the retained union once, when selecting, not per read.
+		for (const metadata of path) {
+			const entry = this.#active.get(metadata.id);
+			if (!entry) continue;
+			this.#active.delete(metadata.id);
+			this.#active.set(metadata.id, entry);
+		}
+		const context: SelectedContext = {
+			generation: this.#generation,
+			leaf,
+			provider,
+			display,
+			inferredModel: !provider.some(isExplicitDefaultModelChange),
+		};
+		this.#contextCache = context;
+		return context;
 	}
 	update(entry: SessionEntry): void {
 		const indexed = this.#entriesById.get(entry.id);
 		if (!indexed) throw new Error(`Session entry ${entry.id} not found`);
-		if (indexed.parentId !== entry.parentId || indexed.type !== entry.type) {
-			const siblings = this.#children.get(indexed.parentId);
-			if (siblings) {
-				const at = siblings.indexOf(entry.id);
-				if (at >= 0) siblings.splice(at, 1);
-			}
-			const children = this.#children.get(entry.parentId);
-			if (children) children.push(entry.id);
-			else this.#children.set(entry.parentId, [entry.id]);
-			this.#generation++;
-			this.#branchCache = undefined;
-		}
 		const wasLabel = indexed.type === "label";
+		// A replacement object takes the old one's place in the branch view.
+		if (this.retainedEntry(entry.id) !== entry) this.#branchCache = undefined;
 		indexed.entry = entry;
+		this.#retained.add(indexed);
 		indexed.revision = (indexed.revision ?? 0) + 1;
-		Object.assign(indexed, sessionContextEntryMetadata(entry));
-		indexed.firstKeptEntryId = entry.type === "compaction" ? entry.firstKeptEntryId : undefined;
+		this.#refreshRecord(indexed, entry);
+		// The selections also read payload fields outside the metadata (a
+		// compaction's kept range and kind, a model change's role) and hold the
+		// payload objects, so any announced edit drops them.
+		this.#contextCache = undefined;
 		if (this.#active.has(entry.id)) this.#active.set(entry.id, entry);
 		if (wasLabel || entry.type === "label") {
 			this.#labels.clear();
@@ -871,6 +1010,7 @@ class SessionEntryIndex {
 			if (indexed.entry) indexed.weak = new WeakRef(indexed.entry);
 			indexed.entry = undefined;
 		}
+		if (indexed.entry) this.#retained.add(indexed);
 		indexed.offset = offset;
 		indexed.length = length;
 	}
@@ -4159,18 +4299,7 @@ export class SessionManager {
 
 	/** Materialize only the current leaf's model/collapsed-display dependency closure. */
 	getContextBranch(): SessionEntry[] {
-		const selected = new Map(
-			[
-				...this.#index.contextLeafPath(undefined, this.#index.leafId()),
-				...this.#index.contextLeafPath({ transcript: true, collapseCompactedHistory: true }, this.#index.leafId()),
-			].map(entry => [entry.id, entry]),
-		);
-		const branch: SessionEntry[] = [];
-		for (const metadata of this.#index.metadataPath()) {
-			const entry = selected.get(metadata.id);
-			if (entry) branch.push(entry);
-		}
-		return branch;
+		return this.#index.contextBranch();
 	}
 
 	getEntryCount(): number {
