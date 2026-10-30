@@ -151,7 +151,7 @@ interface HeapProbeResult {
 	contextResultCount: number;
 }
 
-async function runHeapProbe(mode: "compacted" | "uncompacted"): Promise<HeapProbeResult> {
+async function runHeapProbe(mode: "compacted" | "uncompacted" | "agent"): Promise<HeapProbeResult> {
 	const probe = path.join(import.meta.dir, "fixtures", "resume-memory-probe.ts");
 	const proc = Bun.spawn([process.execPath, "--smol", probe, mode], {
 		cwd: path.resolve(import.meta.dir, "../../../.."),
@@ -967,6 +967,17 @@ describe("bounded resume memory", () => {
 		expect(result.exactDemandCount).toBe(64);
 		// An index plus a tiny context has ample headroom; retaining even one
 		// quarter of the old 128 MiB payload violates this bound.
+		expect(result.retainedAfterOpenBytes, evidence).toBeLessThan(32 * MiB);
+		expect(result.retainedAfterDemandBytes, evidence).toBeLessThan(32 * MiB);
+	}, 60_000);
+
+	it("retains less than 32 MiB after an agent session resumes 128 MiB of compacted tool results", async () => {
+		const result = await runHeapProbe("agent");
+		const evidence = JSON.stringify(result);
+		expect(result.contextResultCount).toBe(0);
+		expect(result.exactDemandCount).toBe(64);
+		// Building the session's tools looks up the prompt the restored reply was
+		// sent with; neither that lookup nor any other must hold the old results.
 		expect(result.retainedAfterOpenBytes, evidence).toBeLessThan(32 * MiB);
 		expect(result.retainedAfterDemandBytes, evidence).toBeLessThan(32 * MiB);
 	}, 60_000);
