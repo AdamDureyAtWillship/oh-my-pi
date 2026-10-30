@@ -703,17 +703,9 @@ class SessionEntryIndex {
 		return this.#leaf ? this.get(this.#leaf) : undefined;
 	}
 	finishLoading(): void {
-		if (this.#leaf === null || this.has(this.#leaf)) return;
-		// A late usage marker can outlive a rolled-back target; replay then
-		// selects the newest self-selecting journal entry, as rebuild() does.
-		let leaf: string | null = null;
-		for (let i = this.#ordered.length - 1; i >= 0; i--) {
-			const entry = this.#ordered[i];
-			if (entry.type === "model_usage" && entry.activeLeafId !== undefined) continue;
-			leaf = entry.id;
-			break;
-		}
-		this.setLeaf(leaf);
+		// An off-branch entry (late usage, a routed result) can outlive a rolled-back
+		// target; replay then selects the newest self-selecting journal entry, as rebuild() does.
+		if (this.#leaf !== null && !this.has(this.#leaf)) this.setLeaf(lastSelfSelectedLeafId(this.#ordered));
 	}
 	setLeaf(id: string | null): void {
 		if (this.#leaf === id) return;
@@ -798,12 +790,29 @@ class SessionEntryIndex {
 	metadataPath(id: string | null | undefined = this.#leaf): IndexedSessionEntry[] {
 		return this.#metadataLeafPath(id).reverse();
 	}
-	contextLeafPath(options?: BuildSessionContextOptions): SessionEntry[] {
-		const path = this.#metadataLeafPath();
+	/**
+	 * The leaf a context is built from: the current leaf or, while that is
+	 * unavailable (an off-branch entry naming a rolled-back leaf, or one a
+	 * replica has not received yet), the leaf replay selects, as the canonical
+	 * builder resolves it. Its context's payloads are the ones held.
+	 */
+	contextLeafId(): string | null {
+		const leaf = this.#leaf;
+		if (leaf === null || this.#entriesById.has(leaf)) return leaf;
+		// resolveSessionLeafId(), looking ids up in the index.
+		const last = this.#ordered.at(-1);
+		if (!last) return null;
+		const replayed = sessionEntryLeafId(last);
+		return replayed === null || this.#entriesById.has(replayed) ? replayed : lastSelfSelectedLeafId(this.#ordered);
+	}
+	/** The context entries of `leaf`, by default the leaf the context is built from, leaf first. */
+	contextLeafPath(options?: BuildSessionContextOptions, leaf: string | null = this.contextLeafId()): SessionEntry[] {
+		const path = this.#metadataLeafPath(leaf);
 		const entries = selectSessionContextEntriesFromLeafPath(path, id => this.get(id)!, options);
-		if (!options?.transcript || options.collapseCompactedHistory) {
-			// Retain both provider and collapsed-display dependencies, never the
-			// full transcript requested by an export or historical navigation.
+		if (leaf === this.contextLeafId() && (!options?.transcript || options.collapseCompactedHistory)) {
+			// Retain both provider and collapsed-display dependencies of the current
+			// leaf, never the full transcript requested by an export or historical
+			// navigation, nor the context of another leaf.
 			const display = selectSessionContextEntriesFromLeafPath(path, id => this.get(id)!, {
 				transcript: true,
 				collapseCompactedHistory: true,
@@ -4148,12 +4157,12 @@ export class SessionManager {
 		return this.#index.pathTo(fromId ?? this.#index.leafId());
 	}
 
-	/** Materialize only the current model/collapsed-display dependency closure. */
+	/** Materialize only the current leaf's model/collapsed-display dependency closure. */
 	getContextBranch(): SessionEntry[] {
 		const selected = new Map(
 			[
-				...this.#index.contextLeafPath(),
-				...this.#index.contextLeafPath({ transcript: true, collapseCompactedHistory: true }),
+				...this.#index.contextLeafPath(undefined, this.#index.leafId()),
+				...this.#index.contextLeafPath({ transcript: true, collapseCompactedHistory: true }, this.#index.leafId()),
 			].map(entry => [entry.id, entry]),
 		);
 		const branch: SessionEntry[] = [];

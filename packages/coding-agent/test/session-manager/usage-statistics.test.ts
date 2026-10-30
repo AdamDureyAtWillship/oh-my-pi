@@ -164,6 +164,7 @@ describe("SessionManager usage statistics", () => {
 		expect(resolveSessionLeafId(entries)).toBe(successor);
 		expect(buildSessionContext(entries).messages.at(-1)).toMatchObject({ content: "successor" });
 		expect(buildSessionContext(entries, "missing-entry").messages.at(-1)).toMatchObject({ content: "successor" });
+		expect(session.buildSessionContext().messages.at(-1)).toMatchObject({ content: "successor" });
 		await session.ensureOnDisk();
 		await session.flush();
 		const sessionFile = session.getSessionFile();

@@ -261,7 +261,7 @@ export function sessionContextEntryMetadata(entry: SessionEntry): SessionContext
 			entry.type === "message" && entry.message.role === "assistant" ? entry.message.provider : undefined,
 		assistantTimestamp:
 			entry.type === "message" && entry.message.role === "assistant" ? entry.message.timestamp : undefined,
-		activeLeafId: entry.type === "model_usage" ? entry.activeLeafId : undefined,
+		activeLeafId: entry.activeLeafId,
 	};
 }
 

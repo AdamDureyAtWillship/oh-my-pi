@@ -357,12 +357,14 @@ export type SessionEntry =
 	| ResetBoundaryEntry;
 
 /** Leaf selected when replaying one entry; an off-branch entry restores the active leaf captured at append time. */
-export function sessionEntryLeafId(entry: SessionEntry): string | null {
+export function sessionEntryLeafId(entry: Pick<SessionEntryBase, "id" | "activeLeafId">): string | null {
 	return entry.activeLeafId !== undefined ? entry.activeLeafId : entry.id;
 }
 
 /** Newest entry that selects itself on replay; skips late-usage markers. */
-export function lastSelfSelectedLeafId(entries: readonly SessionEntry[]): string | null {
+export function lastSelfSelectedLeafId(
+	entries: readonly Pick<SessionEntryBase, "id" | "activeLeafId">[],
+): string | null {
 	for (let index = entries.length - 1; index >= 0; index--) {
 		const entry = entries[index];
 		if (sessionEntryLeafId(entry) === entry.id) return entry.id;
