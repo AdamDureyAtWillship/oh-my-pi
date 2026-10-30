@@ -919,7 +919,7 @@ export class SessionMaintenance {
 		}
 
 		if (mode === "thinking") {
-			const latestCompaction = getLatestCompactionEntry(this.#host.sessionManager.iterateBranch("compaction"));
+			const latestCompaction = this.#host.sessionManager.getLatestCompactionEntry();
 			let compactionIndex = -1;
 			const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
 			let anchorIndex = -1;
@@ -2007,7 +2007,7 @@ export class SessionMaintenance {
 			);
 			if (!safeToContinue) {
 				const warning = this.#compactionDeadEndWarning("clear large tool output");
-				const entry = getLatestCompactionEntry(this.#host.sessionManager.iterateBranch("compaction"));
+				const entry = this.#host.sessionManager.getLatestCompactionEntry();
 				if (entry) {
 					entry.warning = warning;
 					this.#host.sessionManager.updateEntry(entry);
@@ -3049,7 +3049,7 @@ export class SessionMaintenance {
 		// The error shouldn't trigger another compaction since we already compacted.
 		// Example: opus fails -> switch to codex -> compact -> switch back to opus -> opus error
 		// is still in context but shouldn't trigger compaction again.
-		const compactionEntry = getLatestCompactionEntry(this.#host.sessionManager.iterateBranch("compaction"));
+		const compactionEntry = this.#host.sessionManager.getLatestCompactionEntry();
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
 		const payloadRejection =
@@ -5254,7 +5254,7 @@ export class SessionMaintenance {
 					// immediately, so a later stamp would not appear until some
 					// unrelated rebuild.
 					if (deadEndWarning && frameRescueResult) {
-						const stampEntry = getLatestCompactionEntry(this.#host.sessionManager.iterateBranch("compaction"));
+						const stampEntry = this.#host.sessionManager.getLatestCompactionEntry();
 						if (stampEntry) {
 							stampEntry.warning = deadEndWarning;
 							this.#host.sessionManager.updateEntry(stampEntry);
@@ -6156,8 +6156,7 @@ export class SessionMaintenance {
 			// the branch's LATEST compaction entry — a frame rescue may have
 			// superseded `savedCompactionEntry` with a rebuilt one, and the
 			// collapsed transcript badges only the active entry.
-			const stampEntry =
-				getLatestCompactionEntry(this.#host.sessionManager.iterateBranch("compaction")) ?? savedCompactionEntry;
+			const stampEntry = this.#host.sessionManager.getLatestCompactionEntry() ?? savedCompactionEntry;
 			if (stampEntry) {
 				stampEntry.warning = deadEndWarning;
 				this.#host.sessionManager.updateEntry(stampEntry);

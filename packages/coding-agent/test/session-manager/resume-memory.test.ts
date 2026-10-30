@@ -3,7 +3,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import type { TextContent } from "@oh-my-pi/pi-ai";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { buildSessionData } from "@oh-my-pi/pi-coding-agent/export/html";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { BlobStore } from "@oh-my-pi/pi-coding-agent/session/blob-store";
 import {
 	createInterruptedToolResults,
@@ -11,6 +13,7 @@ import {
 	describePendingToolCalls,
 	SESSION_EXIT_CUSTOM_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { MODEL_MENTION_ENTRY_TYPE, ModelMentionRegistry } from "@oh-my-pi/pi-coding-agent/session/model-mentions";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type {
 	CompactionEntry,
@@ -1072,6 +1075,62 @@ describe("todo state from a metadata-filtered branch", () => {
 				"t-sibling",
 			]);
 		} finally {
+			await session.close();
+		}
+	});
+});
+
+describe("lookups by metadata after resume", () => {
+	it("find the newest compaction and the model mentions without reading older compactions or other custom entries", async () => {
+		using dir = TempDir.createSync("@resume-metadata-lookups-");
+		const mention = { agent: "m1", selector: "b/y", name: "Y" };
+		const entries: SessionEntry[] = [
+			user("root", null, "first request"),
+			compact("c1", "root", "root"),
+			{ type: "custom", id: "unrelated", parentId: "c1", timestamp, customType: "unrelated", data: {} },
+			{
+				type: "custom",
+				id: "mention",
+				parentId: "unrelated",
+				timestamp,
+				customType: MODEL_MENTION_ENTRY_TYPE,
+				data: mention,
+			},
+			user("middle", "mention", "second request"),
+			compact("c2", "middle", "middle"),
+			user("tail", "c2", "continue"),
+		];
+		const file = await writeJournal(dir.path(), entries);
+		const session = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+		const auth = await AuthStorage.create(":memory:");
+		try {
+			// Blank the records neither lookup needs in the journal, so reading one back fails.
+			const fd = fs.openSync(file, "r+");
+			try {
+				let offset = Buffer.byteLength(
+					`${JSON.stringify({ type: "session", version: 3, id: "resume-memory", timestamp, cwd: dir.path() })}\n`,
+				);
+				for (const entry of entries) {
+					const length = Buffer.byteLength(JSON.stringify(entry));
+					if (entry.id === "c1" || entry.id === "unrelated")
+						fs.writeSync(fd, Buffer.alloc(length, " "), 0, length, offset);
+					offset += length + 1;
+				}
+			} finally {
+				fs.closeSync(fd);
+			}
+			Bun.gc(true);
+
+			expect(session.getLatestCompactionEntry()?.id).toBe("c2");
+			const mentions = new ModelMentionRegistry({
+				sessionManager: session,
+				modelRegistry: new ModelRegistry(auth, path.join(dir.path(), "models.yml")),
+				scopedModels: () => [],
+			});
+			mentions.syncFromBranch();
+			expect(mentions.mentions).toEqual([mention]);
+		} finally {
+			auth.close();
 			await session.close();
 		}
 	});
