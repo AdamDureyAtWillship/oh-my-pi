@@ -14,11 +14,16 @@ import {
 	modelMentionTag,
 } from "@oh-my-pi/pi-tui/prompt/model-mention-syntax";
 import { AUTO_THINKING, parseEffort } from "@oh-my-pi/pi-tui/thinking";
+import type { SessionContextEntryMetadata } from "./session-context";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 /** Journal entry identifying a model the user authorized for delegation. */
 export const MODEL_MENTION_ENTRY_TYPE = "model_mention";
+
+function isModelMentionMetadata(metadata: SessionContextEntryMetadata): boolean {
+	return metadata.type === "custom" && metadata.customType === MODEL_MENTION_ENTRY_TYPE;
+}
 
 /** Replay valid branch entries, keeping the first occurrence of each agent and selector. */
 export function readModelMentions(entries: Iterable<SessionEntry>): ModelMention[] {
@@ -74,7 +79,7 @@ export class ModelMentionRegistry {
 
 	/** Rebuild pseudonyms after resume, rewind, or a session switch. */
 	syncFromBranch(): void {
-		this.#mentions = readModelMentions(this.#host.sessionManager.iterateBranch("custom"));
+		this.#mentions = readModelMentions(this.#host.sessionManager.getBranchMatching(isModelMentionMetadata));
 		this.#bySelector.clear();
 		this.#agents.clear();
 		for (const agent of this.#inheritedAgents) {
