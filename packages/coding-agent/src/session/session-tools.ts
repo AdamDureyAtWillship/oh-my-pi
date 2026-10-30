@@ -64,6 +64,7 @@ import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
 import { SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
+import type { SessionContextEntryMetadata } from "./session-context";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -285,6 +286,10 @@ function promptDigestOfEntry(entry: SessionEntry): string | undefined | null {
 	return typeof entry.data === "string" ? entry.data : undefined;
 }
 
+function isPromptDigestMetadata(metadata: SessionContextEntryMetadata): boolean {
+	return metadata.type === "custom" && metadata.customType === SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE;
+}
+
 /**
  * Structured payload persisted on each {@link XDEV_MOUNT_NOTICE_MESSAGE_TYPE}
  * custom message. Lets a resumed session reconstruct which dynamic devices the
@@ -382,11 +387,14 @@ export class SessionTools {
 	/** Base-prompt digest each primary reply with provider output was produced under. */
 	readonly #replyPromptDigests = new WeakMap<AgentMessage, string>();
 	/**
-	 * Newest digest found in a branch view and how much of it was scanned. The
-	 * session manager's memoized view only grows in place, so a later read of
-	 * the same array scans just the appended entries.
+	 * Newest digest recorded on one session file's branch up to `leafId`, at
+	 * `graphRevision`. While both hold, a later read checks only the digest
+	 * records appended after that leaf; anchoring on ids, not on a branch
+	 * array, holds no payload.
 	 */
-	#recordedDigestScan: { branch: readonly SessionEntry[]; scanned: number; digest: string | undefined } | undefined;
+	#recordedDigestScan:
+		| { sessionFile: string | undefined; graphRevision: number; leafId: string | null; digest: string | undefined }
+		| undefined;
 	/**
 	 * Dynamic (`xd://`) devices the model has already been told are mounted.
 	 * Seeded lazily from persisted history on resume (see
@@ -1530,25 +1538,29 @@ export class SessionTools {
 
 	/** Digest of the base prompt the current branch's newest reply with provider output was produced under. */
 	recordedPromptDigest(): string | undefined {
-		const branch = this.#host.sessionManager.getBranchView();
+		const sessionManager = this.#host.sessionManager;
+		const sessionFile = sessionManager.getSessionFile();
+		const graphRevision = sessionManager.graphRevision;
+		const leafId = sessionManager.getLeafId();
 		const scan = this.#recordedDigestScan;
-		if (scan?.branch === branch) {
-			for (let index = scan.scanned; index < branch.length; index++) {
-				const digest = promptDigestOfEntry(branch[index]);
-				if (digest !== null) scan.digest = digest;
-			}
-			scan.scanned = branch.length;
-			return scan.digest;
-		}
-		let digest: string | undefined;
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const found = promptDigestOfEntry(branch[index]);
-			if (found !== null) {
-				digest = found;
-				break;
+		if (scan && scan.sessionFile === sessionFile && scan.graphRevision === graphRevision) {
+			if (scan.leafId === leafId) return scan.digest;
+			const appended = sessionManager.iterateBranchAfter(scan.leafId, "custom", {
+				matching: isPromptDigestMetadata,
+			});
+			if (appended) {
+				for (const entry of appended) {
+					const digest = promptDigestOfEntry(entry);
+					if (digest !== null) scan.digest = digest;
+				}
+				scan.leafId = leafId;
+				return scan.digest;
 			}
 		}
-		this.#recordedDigestScan = { branch, scanned: branch.length, digest };
+		// Matched on metadata, so the branch's other entries are neither read nor held.
+		const record = sessionManager.getLatestBranchMatching(isPromptDigestMetadata);
+		const digest = record ? (promptDigestOfEntry(record) ?? undefined) : undefined;
+		this.#recordedDigestScan = { sessionFile, graphRevision, leafId, digest };
 		return digest;
 	}
 

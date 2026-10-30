@@ -1,15 +1,25 @@
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
+import { Agent } from "@oh-my-pi/pi-agent-core";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { makeAssistantMessage } from "../helpers";
 
 const MiB = 1024 * 1024;
 const RESULT_COUNT = 64;
 const RESULT_BYTES = 2 * MiB;
 const timestamp = "2026-01-01T00:00:00.000Z";
 const mode = process.argv.at(-1);
-assert(mode === "compacted" || mode === "uncompacted");
+assert(mode === "compacted" || mode === "uncompacted" || mode === "agent");
+// "agent" resumes the compacted journal through an AgentSession, with a kept
+// reply whose prompt digest the session's tools look up as they are built.
+const compacted = mode !== "uncompacted";
 
 function payload(index: number): string {
 	// Distinct strings, with a UTF-8 prefix before every later byte offset.
@@ -52,7 +62,7 @@ async function writeJournal(file: string, cwd: string): Promise<void> {
 		timestamp,
 		message: { role: "user", content: "keep this request", timestamp: 100 },
 	});
-	if (mode === "compacted") {
+	if (compacted) {
 		write({
 			type: "compaction",
 			id: "compact",
@@ -61,6 +71,15 @@ async function writeJournal(file: string, cwd: string): Promise<void> {
 			firstKeptEntryId: "kept",
 			summary: "old results summarized",
 			tokensBefore: 100000,
+		});
+	}
+	if (mode === "agent") {
+		write({
+			type: "message",
+			id: "reply",
+			parentId: "compact",
+			timestamp,
+			message: { ...makeAssistantMessage(), timestamp: 101 },
 		});
 	}
 	await writer.end();
@@ -98,23 +117,40 @@ const session = await SessionManager.open(file, dir.path(), undefined, {
 	throwIfMissing: true,
 	suppressBreadcrumb: true,
 });
+let authStorage: AuthStorage | undefined;
+let agentSession: AgentSession | undefined;
 try {
 	const context = session.buildSessionContext();
+	if (mode === "agent") {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		assert(model);
+		authStorage = await AuthStorage.create(":memory:");
+		agentSession = new AgentSession({
+			agent: new Agent({
+				getApiKey: () => "unused",
+				initialState: { model, systemPrompt: [], tools: [], messages: context.messages },
+			}),
+			sessionManager: session,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(dir.path(), "models.yml")),
+		});
+	}
 	assert.deepEqual(session.getInjectedTtsrRules(), []);
 	assert.equal(session.getCredentialPins().size, 0);
 	assert.equal(session.getLastModelChangeRole(), undefined);
 	const retainedAfterOpenBytes = Math.max(0, (await liveBytes()) - baseline);
 	const contextResultCount = context.messages.filter(message => message.role === "toolResult").length;
-	assert.equal(contextResultCount, mode === "compacted" ? 0 : RESULT_COUNT);
-	if (mode === "compacted") {
-		assert.equal(context.messages.length, 2);
+	assert.equal(contextResultCount, compacted ? 0 : RESULT_COUNT);
+	if (compacted) {
+		assert.equal(context.messages.length, mode === "agent" ? 3 : 2);
 		assert.equal(context.messages[0].role, "compactionSummary");
 		assert.deepEqual(context.messages[1], { role: "user", content: "keep this request", timestamp: 100 });
 	}
-	const exactDemandCount = mode === "compacted" ? readHistoricalPayloads(session) : 0;
+	const exactDemandCount = compacted ? readHistoricalPayloads(session) : 0;
 	const retainedAfterDemandBytes = Math.max(0, (await liveBytes()) - baseline);
-	// Keep both manager and active context live through the second measurement.
+	// Keep the manager, the agent session and the active context live through the second measurement.
 	assert.deepEqual(session.buildSessionContext().messages, context.messages);
+	assert.equal(agentSession?.messages.length, mode === "agent" ? 3 : undefined);
 	await Bun.write(
 		Bun.stdout,
 		JSON.stringify({
@@ -128,5 +164,7 @@ try {
 		}),
 	);
 } finally {
+	await agentSession?.dispose();
+	authStorage?.close();
 	await session.close();
 }

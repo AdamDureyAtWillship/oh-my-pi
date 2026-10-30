@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -1056,5 +1056,51 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				report: "post-resume findings",
 			}),
 		).resolves.toMatchObject({ details: { report: "post-resume findings", rewound: true } });
+	});
+});
+
+describe("AgentSession prompt digest records", () => {
+	it("records each prompt once and finds the newest record without re-reading the branch", async () => {
+		const retuneSchema = type({ goal: type("string") });
+		const retuneTool: AgentTool<typeof retuneSchema, unknown> = {
+			name: "retune",
+			label: "Retune",
+			description: "Change the system prompt",
+			parameters: retuneSchema,
+			async execute() {
+				// The rest of the turn runs under a different prompt.
+				session.agent.setSystemPrompt(["Changed"]);
+				return { content: [{ type: "text", text: "retuned" }] };
+			},
+		};
+		const { session } = await createHarness(
+			[
+				{ content: ["one"], stopReason: "stop" },
+				{ content: ["two"], stopReason: "stop" },
+				{
+					content: [{ type: "toolCall", id: "retune", name: "retune", arguments: { goal: "retune" } }],
+					stopReason: "toolUse",
+				},
+				{ content: ["three"], stopReason: "stop" },
+			],
+			[retuneTool as AgentTool],
+		);
+		const branchSearch = spyOn(session.sessionManager, "getLatestBranchMatching");
+		try {
+			await session.prompt("first");
+			await session.prompt("second");
+			await session.prompt("third");
+
+			expect(branchSearch).toHaveBeenCalledTimes(1);
+		} finally {
+			branchSearch.mockRestore();
+		}
+		const digests = session.sessionManager
+			.getBranch()
+			.flatMap(entry =>
+				entry.type === "custom" && entry.customType === "system-prompt-digest" ? [entry.data] : [],
+			);
+		expect(digests).toHaveLength(2);
+		expect(new Set(digests).size).toBe(2);
 	});
 });
