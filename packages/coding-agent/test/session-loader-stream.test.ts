@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { FileEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import * as sessionLoader from "@oh-my-pi/pi-coding-agent/session/session-loader";
+import type { SessionLoadResult } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 // Parity contract for the ≥8MiB streaming loader (now Bun.JSONL-based): it must
@@ -381,6 +382,86 @@ describe("loadEntriesFromFileStream (Bun.JSONL parity)", () => {
 
 		expect(entryIds(loaded.entries)).toEqual(["s1", "multiline"]);
 		expect(loaded.malformedRecords).toBe(0);
+	});
+
+	it("parses multi-line records in work proportional to the file", async () => {
+		// No record is valid JSON on its own line, so each one is found by parsing:
+		// a run of short records, then one that spans two thousand lines.
+		const records = Array.from({ length: 400 }, (_, index) =>
+			JSON.stringify(msg(`m${index}`, index === 0 ? "s1" : `m${index - 1}`, `text ${index}`), null, 2),
+		);
+		const long = msg("long", "m399", "");
+		long.message.content = Array.from({ length: 500 }, (_, index) => ({ type: "text", text: `part ${index}` }));
+		records.push(JSON.stringify(long, null, 2));
+		const content = `${JSON.stringify(HEADER)}\n${records.join("\n")}\n`;
+		const file = await writeTemp(content);
+		const parseChunk = spyOn(Bun.JSONL, "parseChunk");
+		try {
+			const loaded = await sessionLoader.loadEntriesFromFileStream(file);
+			let parsedBytes = 0;
+			for (const [, start, end] of parseChunk.mock.calls) parsedBytes += (end ?? 0) - (start ?? 0);
+
+			expect(messageIds(loaded.entries)).toHaveLength(401);
+			expect(loaded.malformedRecords).toBe(0);
+			expect(parsedBytes).toBeLessThan(32 * Buffer.byteLength(content));
+		} finally {
+			parseChunk.mockRestore();
+		}
+	});
+
+	it("parses a record spanning many stream chunks no more than when it arrives in one", async () => {
+		const long = msg("long", "s1", "");
+		long.message.content = Array.from({ length: 8000 }, (_, index) => ({ type: "text", text: `part ${index}` }));
+		// A record over thirty thousand lines, one on its own line, and one the file ends inside.
+		const content = `${JSON.stringify(HEADER)}\n${JSON.stringify(long, null, 2)}\n${JSON.stringify(msg("after", "long", "after"))}\n{\n"unfinished": [\n1,\n`;
+		const file = await writeTemp(content);
+		const parsedBytes = async (load: () => Promise<unknown>): Promise<number> => {
+			const parseChunk = spyOn(Bun.JSONL, "parseChunk");
+			try {
+				await load();
+				let parsed = 0;
+				for (const [, start, end] of parseChunk.mock.calls) parsed += (end ?? 0) - (start ?? 0);
+				return parsed;
+			} finally {
+				parseChunk.mockRestore();
+			}
+		};
+		const streamedInChunksOf = async (chunkBytes: number): Promise<{ parsed: number; loaded: SessionLoadResult }> => {
+			const realBunFile = Bun.file.bind(Bun);
+			const bunFileSpy = spyOn(Bun, "file").mockImplementation((arg: unknown, opts?: BlobPropertyBag) => {
+				const handle = realBunFile(arg as string, opts);
+				handle.stream = () =>
+					(async function* () {
+						const bytes = await handle.bytes();
+						for (let start = 0; start < bytes.length; start += chunkBytes)
+							yield bytes.subarray(start, start + chunkBytes);
+					})() as unknown as ReadableStream<Uint8Array<ArrayBuffer>>;
+				return handle;
+			});
+			try {
+				let loaded: SessionLoadResult | undefined;
+				const parsed = await parsedBytes(async () => {
+					loaded = await sessionLoader.loadEntriesFromFileStream(file);
+				});
+				return { parsed, loaded: loaded! };
+			} finally {
+				bunFileSpy.mockRestore();
+			}
+		};
+
+		const whole = await streamedInChunksOf(Buffer.byteLength(content));
+		const small = await streamedInChunksOf(4096);
+		// Resume reads the file through its descriptor, in the stream's own chunks.
+		const resumed = await parsedBytes(async () => {
+			const resume = await sessionLoader.visitSessionFileForResume(file, () => {});
+			if (resume.sourceFd !== undefined) fs.closeSync(resume.sourceFd);
+		});
+
+		expect(entryIds(whole.loaded.entries)).toEqual(["s1", "long", "after"]);
+		expect(whole.loaded.malformedRecords).toBe(1);
+		expect(small.loaded).toEqual(whole.loaded);
+		expect(small.parsed).toBeLessThanOrEqual(whole.parsed);
+		expect(resumed).toBeLessThanOrEqual(whole.parsed);
 	});
 
 	it("counts an unfinished malformed record across chunks before a valid trailing record", async () => {
