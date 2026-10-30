@@ -573,6 +573,36 @@ interface SelectedContext {
 
 type MetadataEdit = "parent" | "metadata";
 
+/**
+ * Options for {@link SessionManager.iterateEntries}, {@link SessionManager.iterateBranch}
+ * and {@link SessionManager.iterateBranchAfter}.
+ */
+export interface SessionEntryIterationOptions {
+	/** Walk from the newest entry back, so a search for a recent entry reads no older ones. */
+	newestFirst?: boolean;
+	/** Read only the entries whose payload-free metadata matches; the others are skipped unread. */
+	matching?: (metadata: SessionContextEntryMetadata) => boolean;
+}
+
+/**
+ * Read the records `records()` returns at the first step, those of `type`
+ * whose payload-free metadata matches, one per step.
+ */
+function* readEach(
+	records: () => readonly IndexedSessionEntry[],
+	read: (record: IndexedSessionEntry) => SessionEntry,
+	type?: SessionEntry["type"],
+	options?: SessionEntryIterationOptions,
+): IterableIterator<SessionEntry> {
+	const loaded = records();
+	const step = options?.newestFirst ? -1 : 1;
+	const matching = options?.matching;
+	for (let position = step < 0 ? loaded.length - 1 : 0; position >= 0 && position < loaded.length; position += step) {
+		const record = loaded[position]!;
+		if ((!type || record.type === type) && (!matching || matching(record))) yield read(record);
+	}
+}
+
 /** Copy `entry`'s metadata into its index record, reporting whether it moved the entry or changed anything else. */
 function refreshIndexedMetadata(indexed: IndexedSessionEntry, entry: SessionEntry): MetadataEdit | undefined {
 	const metadata = sessionContextEntryMetadata(entry);
@@ -600,6 +630,10 @@ const readerRegistry = new FinalizationRegistry<number>(fd => {
 		/* Explicit release may have already closed it. */
 	}
 });
+
+// Entry-graph revisions come from one sequence, so an index that replaces
+// another never repeats a revision a memo was anchored on.
+let lastGraphRevision = 0;
 
 /**
  * Journal-wide facts and byte ranges; only selected context payloads are retained. Entries inserted
@@ -632,6 +666,9 @@ export class SessionEntryIndex {
 	// Records holding their own payload: appends not yet written and announced
 	// updates. A record leaves on the first refresh after its payload is written.
 	#retained = new Set<IndexedSessionEntry>();
+	// Changes whenever the entry graph is rewritten (a clear or rebuild, or a
+	// moved parent), never on an append or a leaf move.
+	#graphRevision = ++lastGraphRevision;
 	#read?: (entry: IndexedSessionEntry) => SessionEntry;
 	#readerFd?: number;
 	#readerPath?: string;
@@ -649,6 +686,7 @@ export class SessionEntryIndex {
 		this.#usage = emptyUsageStatistics();
 		this.#active.clear();
 		this.#generation++;
+		this.#graphRevision = ++lastGraphRevision;
 		this.#branchCache = undefined;
 		if (closeReader) {
 			readerRegistry.unregister(this);
@@ -782,6 +820,10 @@ export class SessionEntryIndex {
 	hasType(type: SessionEntry["type"]): boolean {
 		return this.#ordered.some(entry => entry.type === type);
 	}
+	/** Every record in journal order: the live array, which callers MUST NOT mutate. */
+	records(): readonly IndexedSessionEntry[] {
+		return this.#ordered;
+	}
 	*entriesOfType(type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
 		for (const entry of this.#ordered) if (!type || entry.type === type) yield this.get(entry.id, false)!;
 	}
@@ -859,7 +901,7 @@ export class SessionEntryIndex {
 
 	/** The memoized active-leaf branch, without copying. Callers MUST NOT mutate it. */
 	branchView(): readonly SessionEntry[] {
-		this.#refreshRetained();
+		this.#refreshRetained(true);
 		const cache = this.#branchCache;
 		const retained = cache?.branch.deref();
 		if (cache?.generation === this.#generation && retained) return retained;
@@ -872,16 +914,21 @@ export class SessionEntryIndex {
 	 * Copy in-place edits of the payloads the index holds (the selections and
 	 * records not yet written) into their metadata, as a full walk once did on
 	 * every read. A historical payload read back from disk is a copy: its edits
-	 * reach the index, and the file, through update().
+	 * reach the index, and the file, through update(). `parentsOnly` looks for
+	 * a moved parent alone, all the branch view and graph revision need; other
+	 * edits wait for the next full refresh, which every memo read makes.
 	 */
-	#refreshRetained(): void {
+	#refreshRetained(parentsOnly = false): void {
+		const refresh = (indexed: IndexedSessionEntry, payload: SessionEntry): void => {
+			if (!parentsOnly || payload.parentId !== indexed.parentId) this.#refreshRecord(indexed, payload);
+		};
 		for (const [id, payload] of this.#active) {
 			const indexed = this.#entriesById.get(id);
-			if (indexed) this.#refreshRecord(indexed, indexed.entry ?? payload);
+			if (indexed) refresh(indexed, indexed.entry ?? payload);
 		}
 		for (const indexed of this.#retained) {
 			if (!indexed.entry) this.#retained.delete(indexed);
-			else if (!this.#active.has(indexed.id)) this.#refreshRecord(indexed, indexed.entry);
+			else if (!this.#active.has(indexed.id)) refresh(indexed, indexed.entry);
 		}
 	}
 
@@ -904,6 +951,13 @@ export class SessionEntryIndex {
 		for (const record of this.#ordered) if (record.parentId === indexed.parentId) children.push(record.id);
 		this.#children.set(indexed.parentId, children);
 		this.#generation++;
+		this.#graphRevision = ++lastGraphRevision;
+	}
+
+	/** See {@link SessionManager.graphRevision}. */
+	graphRevision(): number {
+		this.#refreshRetained(true);
+		return this.#graphRevision;
 	}
 
 	/** The root-first metadata path to `id`, memoized for the leaf the context is built from. Callers MUST NOT mutate it. */
@@ -930,6 +984,23 @@ export class SessionEntryIndex {
 	metadataPath(id: string | null | undefined = this.#leaf): IndexedSessionEntry[] {
 		return this.#leafPath(id).slice();
 	}
+	/** The current-branch records after `id`, oldest first; undefined when `id` is not on the branch. */
+	branchAfter(id: string | null): IndexedSessionEntry[] | undefined {
+		const path = this.#leafPath();
+		if (id === null) return path.slice();
+		for (let i = path.length - 1; i >= 0; i--) {
+			if (path[i]!.id === id) return path.slice(i + 1);
+		}
+		return undefined;
+	}
+	/** The newest current-branch entry whose metadata matches; no other entry is read. */
+	latestOnBranch(predicate: (metadata: SessionContextEntryMetadata) => boolean): SessionEntry | undefined {
+		const path = this.#leafPath();
+		for (let i = path.length - 1; i >= 0; i--) {
+			if (predicate(path[i]!)) return this.get(path[i]!.id, false);
+		}
+		return undefined;
+	}
 	/**
 	 * Where the conversation stands: the newest journal entry that {@link movesConversation}, when it
 	 * lies on the active branch; `undefined` when there is none, or the branch sits on an older entry or
@@ -941,7 +1012,7 @@ export class SessionEntryIndex {
 			if (!movesConversation(indexed)) continue;
 			const entry = this.get(indexed.id, false)!;
 			if (!movesConversation(entry)) continue;
-			return this.#metadataLeafPath().some(onPath => onPath.id === entry.id) ? entry : undefined;
+			return this.#leafPath().some(onPath => onPath.id === entry.id) ? entry : undefined;
 		}
 		return undefined;
 	}
@@ -4292,7 +4363,15 @@ export class SessionManager {
 	 * role the session was last assigned.
 	 */
 	getLastModelChangeRole(options?: { skipEphemeral?: boolean }): string | undefined {
-		return lastModelChangeRole([...this.iterateBranch("model_change")], options);
+		for (const entry of this.iterateBranch("model_change", { newestFirst: true })) {
+			if (entry.type !== "model_change") continue;
+			const role = entry.role ?? "default";
+			if (options?.skipEphemeral && (role === EPHEMERAL_MODEL_CHANGE_ROLE || role === PREWALK_MODEL_CHANGE_ROLE)) {
+				continue;
+			}
+			return role;
+		}
+		return undefined;
 	}
 
 	/**
@@ -4301,9 +4380,7 @@ export class SessionManager {
 	 * newest change assigned a role, was a retry fallback hop, or none was recorded.
 	 */
 	getSessionLocalModelChange(): ModelChangeEntry | undefined {
-		const changes = [...this.iterateBranch("model_change")];
-		for (let index = changes.length - 1; index >= 0; index--) {
-			const entry = changes[index];
+		for (const entry of this.iterateBranch("model_change", { newestFirst: true })) {
 			if (entry.type !== "model_change") continue;
 			return entry.role === "temporary" || entry.role === PREWALK_MODEL_CHANGE_ROLE ? entry : undefined;
 		}
@@ -4355,14 +4432,57 @@ export class SessionManager {
 		return this.#index.hasType(type);
 	}
 
-	*iterateEntries(type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
-		yield* this.#index.entriesOfType(type);
+	iterateEntries(type?: SessionEntry["type"], options?: SessionEntryIterationOptions): IterableIterator<SessionEntry> {
+		const index = this.#index;
+		return readEach(
+			() => index.records(),
+			record => index.get(record.id, false)!,
+			type,
+			options,
+		);
 	}
 
-	*iterateBranch(type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
-		for (const metadata of this.#index.metadataPath()) {
-			if (!type || metadata.type === type) yield this.#index.get(metadata.id, false)!;
-		}
+	iterateBranch(type?: SessionEntry["type"], options?: SessionEntryIterationOptions): IterableIterator<SessionEntry> {
+		const index = this.#index;
+		return readEach(
+			() => index.metadataPath(),
+			record => index.get(record.id, false)!,
+			type,
+			options,
+		);
+	}
+
+	/**
+	 * Changes whenever the entry graph is rewritten: a load, clear or rebuild
+	 * (a durable discard, a rolled-back batch), or an entry given another
+	 * parent. Appends and leaf moves leave it as it was, so a memo of the
+	 * branch anchored on a leaf id and this revision can extend itself with
+	 * {@link iterateBranchAfter} while both still hold.
+	 */
+	get graphRevision(): number {
+		return this.#index.graphRevision();
+	}
+
+	/**
+	 * Current-branch entries appended after `entryId`, in path order, or
+	 * undefined when `entryId` is not on the current branch; `null` stands for
+	 * the start of the branch. Lets a memo of the branch read only what is new;
+	 * a rewrite above `entryId` shows only in {@link graphRevision}.
+	 */
+	iterateBranchAfter(
+		entryId: string | null,
+		type?: SessionEntry["type"],
+		options?: SessionEntryIterationOptions,
+	): IterableIterator<SessionEntry> | undefined {
+		const index = this.#index;
+		const after = index.branchAfter(entryId);
+		if (!after) return undefined;
+		return readEach(
+			() => after,
+			record => index.get(record.id, false)!,
+			type,
+			options,
+		);
 	}
 
 	/** Current-branch entries, in path order, whose payload-free metadata matches; others are never read. */
@@ -4372,6 +4492,17 @@ export class SessionManager {
 			if (predicate(metadata)) entries.push(this.#index.get(metadata.id, false)!);
 		}
 		return entries;
+	}
+
+	/** The newest current-branch entry whose payload-free metadata matches; no other entry is read. */
+	getLatestBranchMatching(predicate: (metadata: SessionContextEntryMetadata) => boolean): SessionEntry | undefined {
+		return this.#index.latestOnBranch(predicate);
+	}
+
+	/** The newest compaction on the current branch, or null; no other entry is read. */
+	getLatestCompactionEntry(): CompactionEntry | null {
+		const entry = this.#index.latestOnBranch(metadata => metadata.type === "compaction");
+		return entry?.type === "compaction" ? entry : null;
 	}
 
 	/**
@@ -4410,7 +4541,9 @@ export class SessionManager {
 	/** Strip stale OpenAI Responses replay metadata from loaded assistant entries. */
 	sanitizeLoadedOpenAIResponsesReplayMetadata(): boolean {
 		let changed = false;
-		for (const entry of this.iterateEntries("message")) {
+		for (const entry of this.iterateEntries("message", {
+			matching: metadata => metadata.messageRole === "assistant",
+		})) {
 			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 			const sanitized = sanitizeRehydratedOpenAIResponsesAssistantMessage(entry.message);
 			if (sanitized === entry.message) continue;

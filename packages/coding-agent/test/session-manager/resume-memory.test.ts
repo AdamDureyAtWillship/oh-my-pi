@@ -186,6 +186,21 @@ class PublishedRewriteStorage extends FileSessionStorage {
 }
 
 describe("bounded resume memory", () => {
+	it("does not reread historical tool results while sanitizing resumed assistant metadata", async () => {
+		using dir = TempDir.createSync("@resume-sanitize-filter-");
+		const file = await writeJournal(dir.path(), threeCompactions(1024));
+		const read = spyOn(sessionLoader, "readPositionedSessionEntry");
+		let session: SessionManager | undefined;
+		try {
+			session = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+			expect(read.mock.calls.filter(([, position]) => position.id === "old-large")).toHaveLength(0);
+			expect(read.mock.calls.some(([, position]) => position.messageRole === "assistant")).toBe(true);
+		} finally {
+			await session?.close();
+			read.mockRestore();
+		}
+	});
+
 	it("reopens three compactions with an exact kept tail across an older compaction and old replay state", async () => {
 		using dir = TempDir.createSync("@resume-three-compactions-");
 		const entries = threeCompactions();
