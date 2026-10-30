@@ -851,8 +851,11 @@ export class SessionEntryIndex {
 		return entry;
 	}
 
-	count(): number {
-		return this.#ordered.length;
+	count(type?: SessionEntry["type"]): number {
+		if (!type) return this.#ordered.length;
+		let count = 0;
+		for (const entry of this.#ordered) if (entry.type === type) count++;
+		return count;
 	}
 	*entries(retainIdentity = false): IterableIterator<SessionEntry> {
 		for (const entry of this.#ordered) yield this.get(entry.id, retainIdentity)!;
@@ -4440,8 +4443,9 @@ export class SessionManager {
 		return this.#index.contextBranch();
 	}
 
-	getEntryCount(): number {
-		return this.#index.count();
+	/** Number of entries in the session, or of one type; reads no entry. */
+	getEntryCount(type?: SessionEntry["type"]): number {
+		return this.#index.count(type);
 	}
 
 	hasEntryType(type: SessionEntry["type"]): boolean {

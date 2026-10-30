@@ -341,6 +341,7 @@ export class RemoteAgentSession implements AgentViewSession {
 			getUsageStatistics: () => this.#state.usageStatistics,
 			getSessionName: () => this.#view.sessionName,
 			getEntries: () => [...this.#entries],
+			getEntryCount: type => this.#entryIndex.count(type),
 			getBranch: fromId => this.#entryIndex.pathTo(fromId),
 			getBranchMatching: predicate =>
 				this.#entryIndex

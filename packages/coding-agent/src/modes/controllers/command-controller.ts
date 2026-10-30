@@ -2093,8 +2093,7 @@ export class CommandController {
 		beforeFlush?: (outcome: CompactionOutcome) => void | Promise<void>,
 		options?: Pick<CompactOptions, "internalGuidance" | "readerModel">,
 	): Promise<CompactionOutcome> {
-		const entries = this.ctx.sessionManager.getEntries();
-		const messageCount = entries.filter(e => e.type === "message").length;
+		const messageCount = this.ctx.sessionManager.getEntryCount("message");
 
 		if (messageCount < 2) {
 			this.ctx.showWarning("Nothing to compact (no messages yet)");
@@ -2326,8 +2325,7 @@ export class CommandController {
 			return;
 		}
 
-		const entries = this.ctx.sessionManager.getEntries();
-		const messageCount = entries.filter(e => e.type === "message").length;
+		const messageCount = this.ctx.sessionManager.getEntryCount("message");
 
 		if (messageCount < 2) {
 			this.ctx.showWarning("Nothing to hand off (no messages yet)");
