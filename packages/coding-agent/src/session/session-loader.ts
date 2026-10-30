@@ -261,37 +261,63 @@ function sessionHeaderIdFromPrefix(prefix: Uint8Array, final: boolean): string |
 }
 
 /**
- * Locate the first settled newline without parsing every growing line prefix.
- * Keep the bounded recovery work of the streaming loader while recording exact ranges.
+ * How far {@link firstSettledNewline} has searched for the end of one value.
+ * Offsets count from the value's start, which consumed bytes before it do not move.
  */
-function settledRecordEnd(view: Uint8Array, start: number, firstNewline: number): number {
-	const newlines: number[] = [];
-	let scanned = firstNewline + 1;
-	let tried = 0;
-	for (let target = 1; ; target *= 2) {
-		while (newlines.length < target) {
-			const next = view.indexOf(0x0a, scanned);
-			if (next < 0) break;
-			newlines.push(next);
-			scanned = next + 1;
-		}
-		if (newlines.length <= tried) return -1;
-		const settles = (index: number): boolean => {
-			const { values, error, done } = Bun.JSONL.parseChunk(view, start, newlines[index]! + 1);
-			return values.length > 0 || Boolean(error) || done;
-		};
-		if (settles(newlines.length - 1)) {
-			let low = tried;
-			let high = newlines.length - 1;
-			while (low < high) {
-				const middle = (low + high) >>> 1;
-				if (settles(middle)) high = middle;
-				else low = middle + 1;
+interface SettleSearch {
+	/** How many newlines past the value's first newline have been tried, the value unfinished at each. */
+	tried: number;
+	/** The newlines found past the last one tried, short of the next one to try. */
+	found: number[];
+	/** Where the search for the next newline resumes. */
+	scanned: number;
+}
+
+/**
+ * The first newline at which the value starting at `start` completes or
+ * fails, or -1 while it is still unfinished. Trying one newline at a time
+ * re-parses the growing range once per line, quadratic for a record that
+ * spans many lines, and trying the buffer's last newline first parses every
+ * record after this one. So the 1st, 2nd, 4th, … newlines past the value's
+ * first one are tried and the gap past the last unsettled one is bisected: no
+ * parsed range runs past twice the record's lines. `search` keeps the
+ * progress, so a value that spans stream chunks goes on where the last chunk
+ * left it, and nothing is parsed again until the buffer reaches the next
+ * newline to try or, `atEnd`, the end of the file.
+ */
+function firstSettledNewline(view: Uint8Array, start: number, search: SettleSearch, atEnd: boolean): number {
+	const settles = (newline: number): boolean => {
+		const { values, error, done } = Bun.JSONL.parseChunk(view, start, start + newline + 1);
+		return values.length > 0 || Boolean(error) || done;
+	};
+	while (true) {
+		const wanted = Math.max(1, search.tried * 2) - search.tried;
+		while (search.found.length < wanted) {
+			const next = view.indexOf(0x0a, start + search.scanned);
+			if (next < 0) {
+				search.scanned = view.length - start;
+				break;
 			}
-			return newlines[low]!;
+			search.found.push(next - start);
+			search.scanned = next - start + 1;
 		}
-		tried = newlines.length;
-		if (newlines.length < target) return -1;
+		const gap = search.found;
+		if (gap.length === 0 || (gap.length < wanted && !atEnd)) return -1;
+		if (!settles(gap.at(-1)!)) {
+			search.tried += gap.length;
+			search.found = [];
+			// At the end of the file there is no further newline to try.
+			if (gap.length < wanted) return -1;
+			continue;
+		}
+		let low = 0;
+		let high = gap.length - 1;
+		while (low < high) {
+			const middle = (low + high) >>> 1;
+			if (settles(gap[middle]!)) high = middle;
+			else low = middle + 1;
+		}
+		return start + gap[low]!;
 	}
 }
 
@@ -326,6 +352,9 @@ export async function visitEntriesFromFileStream(
 			await Bun.sleep(0);
 		}
 	};
+	// The value the previous drain left unfinished, now first in the buffer,
+	// and how far the search for its end has got.
+	let unfinished: SettleSearch | undefined;
 	// Fast path: a record that is valid JSON on its own physical line. Anything
 	// else is decided by Bun.JSONL.parseChunk, as in the whole-buffer parsers:
 	// a value left unfinished at a newline extends to the next newline; a valid
@@ -366,35 +395,41 @@ export async function visitEntriesFromFileStream(
 				stopped = true;
 				break;
 			}
-			const firstNewline = view.indexOf(0x0a, consumed);
-			if (firstNewline < 0) break;
 			const start = consumed;
-			const firstLine = decoder.decode(view.subarray(start, firstNewline)).trim();
-			if (!sawFirstLine) {
-				sawFirstLine = true;
-				const slot = firstLine ? parseTitleSlotLine(firstLine) : undefined;
-				if (slot) {
-					titleSlot = titleUpdateFromSlot(slot);
+			let search = unfinished;
+			unfinished = undefined;
+			let recordEnd: number;
+			if (search) recordEnd = firstSettledNewline(view, start, search, atEnd);
+			else {
+				const firstNewline = view.indexOf(0x0a, consumed);
+				if (firstNewline < 0) break;
+				const firstLine = decoder.decode(view.subarray(start, firstNewline)).trim();
+				if (!sawFirstLine) {
+					sawFirstLine = true;
+					const slot = firstLine ? parseTitleSlotLine(firstLine) : undefined;
+					if (slot) {
+						titleSlot = titleUpdateFromSlot(slot);
+						consumed = firstNewline + 1;
+						continue;
+					}
+				}
+				if (!firstLine) {
 					consumed = firstNewline + 1;
 					continue;
 				}
+				let lineEntry: FileEntry | undefined;
+				try {
+					lineEntry = JSON.parse(firstLine) as FileEntry;
+				} catch {}
+				if (lineEntry) {
+					consumed = firstNewline + 1;
+					await emit(lineEntry, start, consumed);
+					continue;
+				}
+				recordEnd = firstNewline;
 			}
-			if (!firstLine) {
-				consumed = firstNewline + 1;
-				continue;
-			}
-			let lineEntry: FileEntry | undefined;
-			try {
-				lineEntry = JSON.parse(firstLine) as FileEntry;
-			} catch {}
-			if (lineEntry) {
-				consumed = firstNewline + 1;
-				await emit(lineEntry, start, consumed);
-				continue;
-			}
-			let recordEnd = firstNewline;
-			let awaitingMoreData = false;
-			while (true) {
+			let settled = false;
+			while (recordEnd >= 0 && !settled) {
 				const { values, error, read, done } = Bun.JSONL.parseChunk(view, start, recordEnd + 1);
 				if (values.length > 0) {
 					// `read` is the absolute end of the parsed value. On success the
@@ -403,31 +438,27 @@ export async function visitEntriesFromFileStream(
 					consumed = recordEnd + 1;
 					await emit(values[0] as FileEntry, start, valueEnd);
 					if (error && !stopped) skipMalformed(read, recordEnd);
-					break;
-				}
-				if (error || done) {
+					settled = true;
+				} else if (error || done) {
 					// Malformed before any value: skip its physical line only.
 					const errorStart = Math.max(start, read);
 					const nextNewline = view.indexOf(0x0a, errorStart);
 					consumed = nextNewline + 1;
 					skipMalformed(errorStart, nextNewline);
-					break;
+					settled = true;
+				} else {
+					search ??= { tried: 0, found: [], scanned: recordEnd - start + 1 };
+					recordEnd = firstSettledNewline(view, start, search, atEnd);
 				}
-				const nextNewline = settledRecordEnd(view, start, recordEnd);
-				if (nextNewline >= 0) {
-					recordEnd = nextNewline;
-					continue;
-				}
-				if (!atEnd) {
-					awaitingMoreData = true;
-					break;
-				}
-				// The value never completes before EOF: one malformed record.
-				consumed = view.length;
-				skipMalformed(start, view.length);
+			}
+			if (settled) continue;
+			if (!atEnd) {
+				unfinished = search;
 				break;
 			}
-			if (awaitingMoreData) break;
+			// The value never completes before EOF: one malformed record.
+			consumed = view.length;
+			skipMalformed(start, view.length);
 		}
 		sink.consume(consumed);
 		offset += consumed;
