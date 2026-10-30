@@ -67,4 +67,34 @@ describe("off-branch leaf replay", () => {
 		expect(reopened.getLeafId()).toBe(secondUser);
 		expect(reopened.buildSessionContext().messages.map(message => message.role)).toEqual(["user", "user"]);
 	});
+
+	it("replays to the newest real entry when a late bash result's captured leaf is gone", async () => {
+		const root = makeTempDir("@pi-off-branch-leaf-");
+		const manager = SessionManager.create(root, path.join(root, "sessions"));
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file path");
+
+		const firstUser = manager.appendMessage(user("first prompt"));
+		const firstAnswer = manager.appendMessage(answer("first answer"));
+		// The leaf the result captured was rolled back, or a replica has not received it yet.
+		manager.ingestReplicatedEntry({
+			type: "message",
+			id: "late-bash-result",
+			parentId: firstUser,
+			timestamp: "2026-10-26T00:00:00.000Z",
+			message: bashResult,
+			activeLeafId: "removed-entry",
+		});
+
+		expect(manager.buildSessionContext().messages.map(message => message.role)).toEqual(["user", "assistant"]);
+		await manager.close();
+
+		const reopened = await SessionManager.open(sessionFile);
+		try {
+			expect(reopened.getLeafId()).toBe(firstAnswer);
+			expect(reopened.buildSessionContext().messages.map(message => message.role)).toEqual(["user", "assistant"]);
+		} finally {
+			await reopened.close();
+		}
+	});
 });
