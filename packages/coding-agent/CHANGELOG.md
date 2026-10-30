@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Per-turn tool-output pruning now reads only the history kept by the latest compaction and the earlier tool calls those results require ([#16517](https://github.com/can1357/oh-my-pi/pull/16517) by [@Komzpa](https://github.com/Komzpa))
+
+### Fixed
+
+- Resuming long compacted sessions now keeps only the active context in memory while leaving older history available for navigation, exports, and edits ([#16517](https://github.com/can1357/oh-my-pi/pull/16517) by [@Komzpa](https://github.com/Komzpa))
+- Long-running sessions no longer retain discarded history or re-read the whole branch on every turn
+- Transcript replay, manual compaction, and context-overflow recovery no longer load discarded history just to count entries or find a compaction
+
 ## [18.18.3] - 2026-11-09
 
 ### Breaking Changes
