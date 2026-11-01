@@ -2247,11 +2247,16 @@ export class SessionManager {
 			!this.#storage.existsSync(this.#sessionFile) ||
 			this.#sessionOwnedElsewhere()
 		) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
 			await this.#rewriteAtomically();
 			return;
 		}
 
 		const epoch = this.#diskEpoch;
+		const revision = this.#bodyRevision;
+		this.#fileIsCurrent = false;
+		this.#rewriteRequired = true;
 		await this.#scheduleDiskWork(
 			async () => {
 				if (this.#released) return;
@@ -2262,7 +2267,10 @@ export class SessionManager {
 					await this.#appendWriter().append(line);
 					this.#recordDurableAppend(line);
 					await this.#storage.updateSessionTitle(sessionFile, update);
-					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
+					if (this.#diskEpoch === epoch && this.#bodyRevision === revision) {
+						this.#fileIsCurrent = true;
+						this.#rewriteRequired = false;
+					}
 				} catch {
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
 					this.#clearDiskError();
@@ -2649,6 +2657,7 @@ export class SessionManager {
 		if (this.#persist && this.#sessionFile) {
 			this.#expectedDiskSize = relocatedDiskSize;
 			this.#forceFileCreation = true;
+			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
 			await this.#rewriteAtomically();
 		}
@@ -3040,6 +3049,8 @@ export class SessionManager {
 			const hasAssistant = this.#historyContainsAssistantMessage();
 			if (this.#persist && this.#sessionFile && (sessionFileExisted || hasAssistant)) {
 				this.#forceFileCreation = true;
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = true;
 				await this.#rewriteAtomically();
 			}
 
