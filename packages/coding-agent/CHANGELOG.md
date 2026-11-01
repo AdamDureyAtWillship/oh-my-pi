@@ -6,6 +6,10 @@
 
 - Added queueable compaction: `/compact` sent with the follow-up key (Ctrl+Q) while the agent works now runs when it yields instead of interrupting it ([#17397](https://github.com/can1357/oh-my-pi/pull/17397) by [@H4vC](https://github.com/H4vC))
 
+### Changed
+
+- SQL session stores maintain a nullable `title_indexed_size` freshness column automatically; externally managed schemas using `createTable: false` must provide it alongside the existing title columns.
+
 ### Fixed
 
 - Startup prewalk now arms a later fallback candidate of the role named by prewalk.into when its first candidate is unavailable, matching /prewalk and /new ([#17373](https://github.com/can1357/oh-my-pi/pull/17373)).
@@ -14,6 +18,9 @@
 - Read-only session open/close keeps malformed, migrated, and replay-sanitized journals untouched and never claims ownership or creates a sibling; caller mutations and pending durable writes still finish at shutdown ([#17431](https://github.com/can1357/oh-my-pi/pull/17431) by [@AdamDureyAtWillship](https://github.com/AdamDureyAtWillship))
 - Pending move and rollback rewrites are marked dirty before yielding, so sealing cannot drop caller changes. Empty explicit sessions remain pending until their header is durably published ([#17431](https://github.com/can1357/oh-my-pi/pull/17431) by [@AdamDureyAtWillship](https://github.com/AdamDureyAtWillship))
 - Title changes use the ordinary ordered journal append path, preserving follow-up turns and overlapping renames without full-file rewrites or late title-slot writes. Resume and listing derive the current title from the journal; deferred-backend rewrites wait for confirmed appends and release retained entries after shutdown ([#17431](https://github.com/can1357/oh-my-pi/pull/17431) by [@AdamDureyAtWillship](https://github.com/AdamDureyAtWillship))
+- Deferred append acknowledgements, failures, writer shutdowns, and title notifications stay attached to their issuing session across branching and rollback, preserving the replacement session's durability and ownership.
+- Persistent remote clones reconcile divergent journals asynchronously, preserving physical title/source/timestamp order and newer local renames while unshared compare-and-swap conflicts still fail closed.
+- Session lists use maintained Redis/SQL title metadata and lazily reconcile legacy metadata once. File title scans skip decoding unrelated complete records; continue and resume inspect only the relevant candidates.
 - Sealed shutdown rewrites recover deleted or externally changed session files, check deferred-backend ownership, and await sibling artifact copies; failed internal copies, forks, and relocations release ownership without publishing orphan journals ([#17431](https://github.com/can1357/oh-my-pi/pull/17431) by [@AdamDureyAtWillship](https://github.com/AdamDureyAtWillship))
 
 ## [18.14.0] - 2026-10-29
