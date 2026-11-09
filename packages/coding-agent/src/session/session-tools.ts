@@ -316,7 +316,8 @@ export function promptDigestOfEntry(entry: SessionEntry): string | undefined | n
 	return typeof entry.data === "string" ? entry.data : undefined;
 }
 
-function isPromptDigestMetadata(metadata: SessionContextEntryMetadata): boolean {
+/** Whether `metadata` is a recorded prompt digest's, so {@link promptDigestOfEntry} may find one in its payload. */
+export function isPromptDigestMetadata(metadata: SessionContextEntryMetadata): boolean {
 	return metadata.type === "custom" && metadata.customType === SYSTEM_PROMPT_DIGEST_CUSTOM_TYPE;
 }
 

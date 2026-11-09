@@ -609,8 +609,11 @@ export class SessionMaintenance {
 	/** The compaction entry behind each archive summary message, once found. */
 	readonly #summaryEntries = new WeakMap<CompactionSummaryMessage, CompactionEntry>();
 	/** Whether each legendless archive summary message may replay reasoning ({@link #mayReplayThinking}), or the
-	 *  branch view on which no archive backed it. */
-	readonly #replaysThinking = new WeakMap<CompactionSummaryMessage, boolean | readonly SessionEntry[]>();
+	 *  graph revision and leaf at which no archive on the branch backed it (ids, so no payload is held). */
+	readonly #replaysThinking = new WeakMap<
+		CompactionSummaryMessage,
+		boolean | { graphRevision: number; leafId: string | null }
+	>();
 	/** Reader copies that read an archive as text in place of its frames. */
 	readonly #textCopies = new WeakSet<AgentMessage>();
 	/** Reader copies of archive summary messages keyed by the original message, then by {@link ArchiveReader.key},
@@ -4284,12 +4287,12 @@ export class SessionMaintenance {
 	 * Count a rebuilt context the way {@link #estimateStoredContextTokens} will once it is committed:
 	 * a summary carrying frames is counted as itself so each frame gets the active model's frame
 	 * price, and an archive as the active model reads it ({@link #messagesAsRead}), found among
-	 * `entries` (the projected branch when the compaction is not committed yet). Native Responses
-	 * history replaces the display summary and excludes opaque ciphertext.
+	 * `entries` (the projected branch when the compaction is not committed yet, else the branch's
+	 * compactions). Native Responses history replaces the display summary and excludes opaque ciphertext.
 	 */
 	#countProjectedMessages(
 		rebuilt: AgentMessage[],
-		entries: readonly SessionEntry[] = this.#host.sessionManager.getBranchView(),
+		entries: readonly SessionEntry[] = this.#branchCompactions(),
 	): number {
 		const messages = this.#messagesAsRead(rebuilt, entries);
 		const options = { excludeEncryptedReasoning: true } as const;
@@ -4310,6 +4313,11 @@ export class SessionMaintenance {
 			this.#tokenizer.countMessages(archives, options) +
 			this.#tokenizer.countMessages(convertToLlm(rest), options)
 		);
+	}
+
+	/** The current branch's compactions, which hold the archives summaries are read from; no other entry is read. */
+	#branchCompactions(): SessionEntry[] {
+		return [...this.#host.sessionManager.iterateBranch("compaction")];
 	}
 
 	/**
@@ -4554,7 +4562,7 @@ export class SessionMaintenance {
 				this.#estimateStoredContextTokens(
 					[],
 					tokenizer,
-					this.#messagesAsRead(messages, this.#host.sessionManager.getBranchView(), model),
+					this.#messagesAsRead(messages, this.#branchCompactions(), model),
 				) - storedExcludedTokens,
 			),
 		);
@@ -4974,20 +4982,26 @@ export class SessionMaintenance {
 
 	/**
 	 * Whether `message` may replay reasoning: its summary declares `¶think:` scopes, or the archive behind it
-	 * keeps them ({@link snapcompact.archiveIncludesThinking}). Decided once per message; a summary no archive
-	 * backs is looked up again only once the branch changes.
+	 * keeps them ({@link snapcompact.archiveIncludesThinking}). Decided once per message; for a summary no archive
+	 * backs, a branch that only grew is checked for its new compactions, and a changed one is searched again.
 	 */
 	#mayReplayThinking(message: CompactionSummaryMessage): boolean {
 		if (snapcompact.summaryIncludesThinking(message.summary)) return true;
 		if (!mayHoldArchive(message)) return false;
 		const known = this.#replaysThinking.get(message);
 		if (typeof known === "boolean") return known;
-		const branch = this.#host.sessionManager.getBranchView();
-		if (known === branch) return false;
-		const entry = this.#archiveEntry(message, branch);
+		const sessionManager = this.#host.sessionManager;
+		const graphRevision = sessionManager.graphRevision;
+		const leafId = sessionManager.getLeafId();
+		if (known?.graphRevision === graphRevision && known.leafId === leafId) return false;
+		const appended =
+			known?.graphRevision === graphRevision
+				? sessionManager.iterateBranchAfter(known.leafId, "compaction")
+				: undefined;
+		const entry = this.#archiveEntry(message, appended ?? sessionManager.iterateBranch("compaction"));
 		const archive = entry && snapcompact.getPreservedArchive(entry.preserveData);
 		if (!archive) {
-			this.#replaysThinking.set(message, branch);
+			this.#replaysThinking.set(message, { graphRevision, leafId });
 			return false;
 		}
 		const replays = snapcompact.archiveIncludesThinking(message.summary, archive);
@@ -5029,19 +5043,22 @@ export class SessionMaintenance {
 		return read ?? messages;
 	}
 
-	/** The compaction entry among `entries` whose snapcompact archive `message` was built from. */
-	#archiveEntry(message: CompactionSummaryMessage, entries: readonly SessionEntry[]): CompactionEntry | undefined {
+	/** The compaction entry among `entries` (path order) whose snapcompact archive `message` was built from. */
+	#archiveEntry(message: CompactionSummaryMessage, entries: Iterable<SessionEntry>): CompactionEntry | undefined {
 		const cached = this.#summaryEntries.get(message);
 		if (cached) return cached;
-		const entry = entries.findLast(
-			(entry): entry is CompactionEntry =>
+		let found: CompactionEntry | undefined;
+		for (const entry of entries) {
+			if (
 				entry.type === "compaction" &&
 				entry.summary === message.summary &&
 				new Date(entry.timestamp).getTime() === message.timestamp &&
-				snapcompact.getPreservedArchive(entry.preserveData) !== undefined,
-		);
-		if (entry) this.#summaryEntries.set(message, entry);
-		return entry;
+				snapcompact.getPreservedArchive(entry.preserveData) !== undefined
+			)
+				found = entry;
+		}
+		if (found) this.#summaryEntries.set(message, found);
+		return found;
 	}
 
 	/** `message` rebuilt from the archive view `reader` reads, or `message` itself when that is the original. */
@@ -5050,7 +5067,7 @@ export class SessionMaintenance {
 		model: Model,
 		reader: ArchiveReader,
 	): Promise<CompactionSummaryMessage> {
-		const entry = this.#archiveEntry(message, this.#host.sessionManager.getBranchView());
+		const entry = this.#archiveEntry(message, this.#host.sessionManager.iterateBranch("compaction"));
 		let view: snapcompact.ArchiveView | undefined;
 		if (entry) {
 			view = reader.withoutFrames

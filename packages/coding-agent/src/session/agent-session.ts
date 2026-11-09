@@ -506,7 +506,7 @@ import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
+import { isPromptDigestMetadata, promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -792,23 +792,33 @@ interface BranchPromptCacheObservation {
 }
 
 /**
- * A branch view folded up to `scanned`. The session manager extends its
- * memoized view in place on append and hands out a new array otherwise, so a
- * later read of the same array folds only the appended entries.
+ * The branch of one session file folded up to `leafId`, at `graphRevision`. While both hold, a later
+ * read folds only the entries appended after that leaf; anchoring on ids, not on a branch array,
+ * holds no payload.
  */
 interface BranchPromptCacheScan {
-	branch: readonly SessionEntry[];
-	scanned: number;
+	sessionFile: string | undefined;
+	graphRevision: number;
+	leafId: string | null;
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
 	observation: BranchPromptCacheObservation | undefined;
 }
 
-/** Folds `scan.branch`'s unscanned entries into what the newest reply that read or wrote the prompt cache left. */
-function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
-	const { branch } = scan;
-	for (let index = scan.scanned; index < branch.length; index++) {
-		const entry = branch[index]!;
+/** The entries {@link scanBranchPromptCache} folds, by their payload-free metadata. */
+function foldsIntoPromptCacheScan(metadata: SessionContextEntryMetadata): boolean {
+	return (
+		isPromptDigestMetadata(metadata) ||
+		metadata.type === "compaction" ||
+		metadata.type === "reset_boundary" ||
+		metadata.type === "model_usage" ||
+		metadata.messageRole === "assistant"
+	);
+}
+
+/** Folds `entries`, in path order, into what the newest reply that read or wrote the prompt cache left. */
+function scanBranchPromptCache(scan: BranchPromptCacheScan, entries: Iterable<SessionEntry>): void {
+	for (const entry of entries) {
 		const digest = promptDigestOfEntry(entry);
 		if (digest !== null) {
 			scan.digest = digest;
@@ -839,7 +849,6 @@ function scanBranchPromptCache(scan: BranchPromptCacheScan): void {
 		if (reply.stopReason === "error" || reply.usage.cacheRead + reply.usage.cacheWrite <= 0) continue;
 		scan.observation = { reply, warmedAt: 0, refreshMissed: false, compacted: false, promptDigest: scan.digest };
 	}
-	scan.scanned = branch.length;
 }
 
 type AgentContinueSkipReason =
@@ -1513,7 +1522,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				shape: PromptCacheShape;
 		  }
 		| undefined;
-	/** {@link #branchPromptCacheObservation}'s fold of the current branch view. */
+	/** {@link #branchPromptCacheObservation}'s fold of the current branch. */
 	#branchPromptCacheScan: BranchPromptCacheScan | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
@@ -6332,17 +6341,35 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/**
 	 * The branch's newest reply that used the prompt cache, with what followed it
 	 * (the latest warm refresh, a compaction) and the system prompt digest
-	 * recorded before it. Each entry is folded once per branch view.
+	 * recorded before it. Each entry is folded once while the branch only grows;
+	 * entries the fold ignores are not read.
 	 */
 	#branchPromptCacheObservation(): BranchPromptCacheObservation | undefined {
-		const branch = this.sessionManager.getBranchView();
-		let scan = this.#branchPromptCacheScan;
-		if (scan?.branch !== branch) {
-			scan = { branch, scanned: 0, digest: undefined, observation: undefined };
-			this.#branchPromptCacheScan = scan;
+		const sessionManager = this.sessionManager;
+		const sessionFile = sessionManager.getSessionFile();
+		const graphRevision = sessionManager.graphRevision;
+		const leafId = sessionManager.getLeafId();
+		const scan = this.#branchPromptCacheScan;
+		const options = { matching: foldsIntoPromptCacheScan };
+		if (scan && scan.sessionFile === sessionFile && scan.graphRevision === graphRevision) {
+			if (scan.leafId === leafId) return scan.observation;
+			const appended = sessionManager.iterateBranchAfter(scan.leafId, undefined, options);
+			if (appended) {
+				scanBranchPromptCache(scan, appended);
+				scan.leafId = leafId;
+				return scan.observation;
+			}
 		}
-		if (scan.scanned < branch.length) scanBranchPromptCache(scan);
-		return scan.observation;
+		const fresh: BranchPromptCacheScan = {
+			sessionFile,
+			graphRevision,
+			leafId,
+			digest: undefined,
+			observation: undefined,
+		};
+		this.#branchPromptCacheScan = fresh;
+		scanBranchPromptCache(fresh, sessionManager.iterateBranch(undefined, options));
+		return fresh.observation;
 	}
 
 	/** Prompt size (input + cacheRead + cacheWrite) of the most recent real provider response. */
