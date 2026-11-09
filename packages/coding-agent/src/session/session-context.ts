@@ -368,8 +368,8 @@ export function selectSessionContextEntriesFromLeafPath(
 		}
 	} else selectRange(0, path.length);
 	// Settings precede the emission boundary. Keep one legacy model-inference
-	// assistant only when no explicit default model has superseded it.
-	let inferredAssistant: string | undefined;
+	// assistant, the newest the canonical builder infers from (not a synthetic
+	// error), only when no explicit default model has superseded it.
 	let explicitDefault = false;
 	for (let i = path.length - 1; i >= 0; i--) {
 		const entry = path[i];
@@ -380,9 +380,18 @@ export function selectSessionContextEntriesFromLeafPath(
 		) {
 			selected.add(entry.id);
 			if (entry.type === "model_change" && isExplicitDefaultModelChange(read(entry.id))) explicitDefault = true;
-		} else if (!explicitDefault && entry.messageRole === "assistant") inferredAssistant = entry.id;
+		}
 	}
-	if (!explicitDefault && inferredAssistant) selected.add(inferredAssistant);
+	if (!explicitDefault) {
+		for (const entry of path) {
+			if (entry.messageRole !== "assistant") continue;
+			const reply = read(entry.id);
+			if (reply.type === "message" && reply.message.role === "assistant" && reply.message.model === "<synthetic>")
+				continue;
+			selected.add(entry.id);
+			break;
+		}
+	}
 	// The notebook may live before a compaction, but never before a reset.
 	for (let i = 0; i < (resetIdx < 0 ? path.length : resetIdx); i++) {
 		if (path[i].customType !== CONTEXT_NOTES_ENTRY_TYPE) continue;

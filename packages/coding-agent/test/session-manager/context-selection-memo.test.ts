@@ -337,6 +337,31 @@ describe("SessionManager context selection memo", () => {
 		}
 	});
 
+	it("infers the default model past a synthetic error reply after a compaction, in memory and reopened", async () => {
+		using dir = TempDir.createSync("@context-selection-synthetic-reply-");
+		const session = SessionManager.create(dir.path(), dir.path());
+		const file = session.getSessionFile();
+		if (!file) throw new Error("Expected a session file");
+		try {
+			session.appendMessage(reply());
+			const kept = session.appendMessage(user("kept"));
+			session.appendCompaction("Earlier work.", undefined, kept, 1000);
+			await expectFreshSelection(session, "compacted");
+			session.appendMessage({ ...reply(), model: "<synthetic>", stopReason: "error", errorMessage: "API Error" });
+			await expectFreshSelection(session, "synthetic error appended");
+			expect(session.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-20250514");
+		} finally {
+			await session.close();
+		}
+		const reopened = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+		try {
+			await expectFreshSelection(reopened, "reopened");
+			expect(reopened.buildSessionContext().models.default).toBe("anthropic/claude-sonnet-4-20250514");
+		} finally {
+			await reopened.close();
+		}
+	});
+
 	it("selects the history behind a compaction the reading model cannot replay, on a reopened session", async () => {
 		using dir = TempDir.createSync("@context-selection-readable-boundary-");
 		const session = SessionManager.create(dir.path(), dir.path());
