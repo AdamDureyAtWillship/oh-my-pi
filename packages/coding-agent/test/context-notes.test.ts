@@ -143,6 +143,21 @@ describe("experimental context notes", () => {
 		expect(sessionManager.getBranch()).toHaveLength(0);
 	});
 
+	it("reads the latest notebook through the tool, and none from before a context reset", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated({ "compaction.experimentalContextManagement": true });
+		const tool = ContextNotesTool.createIf(toolSession(settings, sessionManager));
+		if (!tool) throw new Error("expected context notes tool");
+
+		await tool.execute("first", { text: "first notebook" });
+		sessionManager.appendMessage({ role: "user", content: "between revisions", timestamp: Date.now() });
+		await tool.execute("second", { text: "second notebook" });
+		expect((await tool.execute("read", {})).details).toMatchObject({ text: "second notebook" });
+
+		sessionManager.appendResetBoundary();
+		expect((await tool.execute("read-after-reset", {})).details).toEqual({ entryId: undefined, text: "" });
+	});
+
 	it("uses only the active branch's latest notebook and hides it after a context reset", () => {
 		const shared = noteEntry("base", null, "shared context");
 		const branchA: SessionEntry[] = [shared, noteEntry("a", "base", "branch A context")];

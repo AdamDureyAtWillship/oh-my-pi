@@ -18,6 +18,7 @@ import {
 	MAX_CONTEXT_NOTES_BYTES,
 } from "../session/context-notes";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
+import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from ".";
 import { throwIfAborted } from "./tool-errors";
 
@@ -41,6 +42,22 @@ export interface NewContextToolDetails {
 }
 
 type ExperimentalContextSessionManager = NonNullable<ToolSession["sessionManager"]>;
+
+/**
+ * The branch entries {@link getContextNotes} decides on, reset markers and notebook revisions, matched on
+ * metadata where the journal can, so the branch's other payloads are not read.
+ */
+function notebookEntries(manager: ExperimentalContextSessionManager): readonly SessionEntry[] {
+	return manager.getBranchMatching
+		? manager.getBranchMatching(
+				metadata => metadata.type === "reset_boundary" || metadata.customType === CONTEXT_NOTES_ENTRY_TYPE,
+			)
+		: manager.getBranch();
+}
+
+function branchLeafId(manager: ExperimentalContextSessionManager): string | null | undefined {
+	return manager.getLeafId ? manager.getLeafId() : manager.getBranch().at(-1)?.id;
+}
 
 function resolveExperimentalContextSession(session: ToolSession): ExperimentalContextSessionManager | undefined {
 	if (cfgCompactionExperimentalContextManagement.get(session.settings) !== true || session.isDisposed?.()) {
@@ -110,7 +127,7 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 			throw new ToolError("context_notes text must be a string.");
 		}
 		if (params.text === undefined) {
-			const notes = getContextNotes(manager.getBranch());
+			const notes = getContextNotes(notebookEntries(manager));
 			return {
 				content: [{ type: "text", text: notes?.text ?? "No context notes are stored for this session branch." }],
 				details: notes ? { entryId: notes.entryId, text: notes.text } : { entryId: undefined, text: "" },
@@ -125,7 +142,7 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 		}
 
 		const ownerId = this.session.getSessionId?.();
-		const branchLeafId = manager.getBranch().at(-1)?.id;
+		const leafId = branchLeafId(manager);
 		await manager.ensureOnDisk();
 		throwIfAborted(signal);
 		const currentManager = getExperimentalContextSession(this.session);
@@ -135,7 +152,7 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 			!ownerId ||
 			this.session.getSessionId?.() !== ownerId ||
 			manager.getSessionId?.() !== ownerId ||
-			manager.getBranch().at(-1)?.id !== branchLeafId
+			branchLeafId(manager) !== leafId
 		) {
 			throw new ToolError("Experimental context notes were not saved because the session branch changed.");
 		}
