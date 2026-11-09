@@ -487,5 +487,14 @@ describe("AgentSession prompt-cache status", () => {
 				reason: { kind: "expired", at: sentAt + SHORT_TTL_MS },
 			});
 		});
+
+		it("reads the branch again after an announced edit leaves its shape and leaf as they were", () => {
+			const replyId = append(usage({ cacheWrite: 50_000, cttl: { ephemeral5m: 50_000 } }));
+			expect(session.getPromptCacheStatus(Date.now() + 1)).toMatchObject({ state: "warm", inferred: true });
+			const entry = session.sessionManager.getEntry(replyId);
+			if (entry?.type !== "message" || entry.message.role !== "assistant") throw new Error("Expected the reply");
+			session.sessionManager.updateEntry({ ...entry, message: { ...entry.message, stopReason: "error" } });
+			expect(session.getPromptCacheStatus(Date.now() + 1)).toBeUndefined();
+		});
 	});
 });

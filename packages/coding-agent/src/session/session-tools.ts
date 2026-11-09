@@ -441,12 +441,18 @@ export class SessionTools {
 	readonly #replyPromptDigests = new WeakMap<AgentMessage, string>();
 	/**
 	 * Newest digest recorded on one session file's branch up to `leafId`, at
-	 * `graphRevision`. While both hold, a later read checks only the digest
-	 * records appended after that leaf; anchoring on ids, not on a branch
-	 * array, holds no payload.
+	 * `graphRevision` and `updateSequence`. While they hold, a later read checks
+	 * only the digest records appended after that leaf; anchoring on ids, not on
+	 * a branch array, holds no payload.
 	 */
 	#recordedDigestScan:
-		| { sessionFile: string | undefined; graphRevision: number; leafId: string | null; digest: string | undefined }
+		| {
+				sessionFile: string | undefined;
+				graphRevision: number;
+				updateSequence: number;
+				leafId: string | null;
+				digest: string | undefined;
+		  }
 		| undefined;
 	/** {@link currentPromptDigest} for the base prompt array it hashed. */
 	#currentPromptDigest: { base: readonly string[]; digest: string } | undefined;
@@ -1702,9 +1708,15 @@ export class SessionTools {
 		const sessionManager = this.#host.sessionManager;
 		const sessionFile = sessionManager.getSessionFile();
 		const graphRevision = sessionManager.graphRevision;
+		const updateSequence = sessionManager.updateSequence;
 		const leafId = sessionManager.getLeafId();
 		const scan = this.#recordedDigestScan;
-		if (scan && scan.sessionFile === sessionFile && scan.graphRevision === graphRevision) {
+		if (
+			scan &&
+			scan.sessionFile === sessionFile &&
+			scan.graphRevision === graphRevision &&
+			scan.updateSequence === updateSequence
+		) {
 			if (scan.leafId === leafId) return scan.digest;
 			const appended = sessionManager.iterateBranchAfter(scan.leafId, "custom", {
 				matching: isPromptDigestMetadata,
@@ -1721,7 +1733,7 @@ export class SessionTools {
 		// Matched on metadata, so the branch's other entries are neither read nor held.
 		const record = sessionManager.getLatestBranchMatching(isPromptDigestMetadata);
 		const digest = record ? (promptDigestOfEntry(record) ?? undefined) : undefined;
-		this.#recordedDigestScan = { sessionFile, graphRevision, leafId, digest };
+		this.#recordedDigestScan = { sessionFile, graphRevision, updateSequence, leafId, digest };
 		return digest;
 	}
 

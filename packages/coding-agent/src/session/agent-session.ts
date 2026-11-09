@@ -792,13 +792,14 @@ interface BranchPromptCacheObservation {
 }
 
 /**
- * The branch of one session file folded up to `leafId`, at `graphRevision`. While both hold, a later
- * read folds only the entries appended after that leaf; anchoring on ids, not on a branch array,
- * holds no payload.
+ * The branch of one session file folded up to `leafId`, at `graphRevision` and `updateSequence`.
+ * While they hold, a later read folds only the entries appended after that leaf; anchoring on ids,
+ * not on a branch array, holds no payload.
  */
 interface BranchPromptCacheScan {
 	sessionFile: string | undefined;
 	graphRevision: number;
+	updateSequence: number;
 	leafId: string | null;
 	/** Newest system prompt digest recorded in the scanned entries. */
 	digest: string | undefined;
@@ -6348,10 +6349,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const sessionManager = this.sessionManager;
 		const sessionFile = sessionManager.getSessionFile();
 		const graphRevision = sessionManager.graphRevision;
+		const updateSequence = sessionManager.updateSequence;
 		const leafId = sessionManager.getLeafId();
 		const scan = this.#branchPromptCacheScan;
 		const options = { matching: foldsIntoPromptCacheScan };
-		if (scan && scan.sessionFile === sessionFile && scan.graphRevision === graphRevision) {
+		if (
+			scan &&
+			scan.sessionFile === sessionFile &&
+			scan.graphRevision === graphRevision &&
+			scan.updateSequence === updateSequence
+		) {
 			if (scan.leafId === leafId) return scan.observation;
 			const appended = sessionManager.iterateBranchAfter(scan.leafId, undefined, options);
 			if (appended) {
@@ -6363,6 +6370,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const fresh: BranchPromptCacheScan = {
 			sessionFile,
 			graphRevision,
+			updateSequence,
 			leafId,
 			digest: undefined,
 			observation: undefined,

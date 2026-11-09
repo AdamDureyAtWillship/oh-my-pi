@@ -609,10 +609,10 @@ export class SessionMaintenance {
 	/** The compaction entry behind each archive summary message, once found. */
 	readonly #summaryEntries = new WeakMap<CompactionSummaryMessage, CompactionEntry>();
 	/** Whether each legendless archive summary message may replay reasoning ({@link #mayReplayThinking}), or the
-	 *  graph revision and leaf at which no archive on the branch backed it (ids, so no payload is held). */
+	 *  graph revision, edit sequence and leaf at which no archive on the branch backed it (no payload is held). */
 	readonly #replaysThinking = new WeakMap<
 		CompactionSummaryMessage,
-		boolean | { graphRevision: number; leafId: string | null }
+		boolean | { graphRevision: number; updateSequence: number; leafId: string | null }
 	>();
 	/** Reader copies that read an archive as text in place of its frames. */
 	readonly #textCopies = new WeakSet<AgentMessage>();
@@ -4983,7 +4983,8 @@ export class SessionMaintenance {
 	/**
 	 * Whether `message` may replay reasoning: its summary declares `¶think:` scopes, or the archive behind it
 	 * keeps them ({@link snapcompact.archiveIncludesThinking}). Decided once per message; for a summary no archive
-	 * backs, a branch that only grew is checked for its new compactions, and a changed one is searched again.
+	 * backs, a branch that only grew is checked for its new compactions, and a changed or edited one is searched
+	 * again.
 	 */
 	#mayReplayThinking(message: CompactionSummaryMessage): boolean {
 		if (snapcompact.summaryIncludesThinking(message.summary)) return true;
@@ -4992,16 +4993,15 @@ export class SessionMaintenance {
 		if (typeof known === "boolean") return known;
 		const sessionManager = this.#host.sessionManager;
 		const graphRevision = sessionManager.graphRevision;
+		const updateSequence = sessionManager.updateSequence;
 		const leafId = sessionManager.getLeafId();
-		if (known?.graphRevision === graphRevision && known.leafId === leafId) return false;
-		const appended =
-			known?.graphRevision === graphRevision
-				? sessionManager.iterateBranchAfter(known.leafId, "compaction")
-				: undefined;
+		const grewOnly = known?.graphRevision === graphRevision && known.updateSequence === updateSequence;
+		if (grewOnly && known.leafId === leafId) return false;
+		const appended = grewOnly ? sessionManager.iterateBranchAfter(known.leafId, "compaction") : undefined;
 		const entry = this.#archiveEntry(message, appended ?? sessionManager.iterateBranch("compaction"));
 		const archive = entry && snapcompact.getPreservedArchive(entry.preserveData);
 		if (!archive) {
-			this.#replaysThinking.set(message, { graphRevision, leafId });
+			this.#replaysThinking.set(message, { graphRevision, updateSequence, leafId });
 			return false;
 		}
 		const replays = snapcompact.archiveIncludesThinking(message.summary, archive);

@@ -452,16 +452,38 @@ describe("snapcompact archive read by another model", () => {
 		}
 		expect(archiveScans).toHaveBeenCalledTimes(firstScans);
 
-		// A summary no archive backs is looked up once per branch, not once per request.
+		// A summary no archive backs is looked up once per branch, not once per request, among the
+		// branch's compactions (`iterateBranch("compaction")`), never through the whole branch.
 		const plain = SessionManager.inMemory();
 		const keptId = plain.appendMessage({ role: "user", content: "Kept turn.", timestamp: Date.now() });
 		plain.appendCompaction(EXTENSION_SUMMARY, "Earlier work.", keptId, 100);
 		const plainSession = startSession(plain, gpt).session;
-		const branchLookups = vi.spyOn(plain.getBranchView(), "findLast");
+		const branchReads = vi.spyOn(plain, "iterateBranch");
+		const branchViews = vi.spyOn(plain, "getBranchView");
 		for (let call = 0; call < 3; call++) {
 			const sent = requestContent(await plainSession.convertMessagesToLlm(plainSession.messages, undefined, claude));
 			expect(sent.text).toContain(EXTENSION_FACT);
 		}
-		expect(branchLookups).toHaveBeenCalledTimes(1);
+		expect(branchReads.mock.calls.filter(args => args.length === 1 && args[0] === "compaction")).toHaveLength(1);
+		expect(branchViews).not.toHaveBeenCalled();
+	});
+
+	it("reads an archive an announced edit attaches to a summary first found without one", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const original = await seedArchive(sessionManager, { summary: EXTENSION_SUMMARY });
+		const compaction = latestCompaction(sessionManager);
+		sessionManager.updateEntry({ ...compaction, preserveData: undefined });
+		const { session } = startSession(sessionManager, gpt);
+		const before = requestContent(await session.convertMessagesToLlm(session.messages, undefined, claude));
+		expect(before.text).toContain(EXTENSION_FACT);
+		expect(before.images).toEqual([]);
+
+		// The edit leaves the branch's shape and leaf as they were.
+		sessionManager.updateEntry({ ...latestCompaction(sessionManager), preserveData: original.preserveData });
+		const after = requestContent(await session.convertMessagesToLlm(session.messages, undefined, claude));
+		const variant = snapcompact.getPreservedArchive(latestCompaction(sessionManager).preserveData)!.withoutThinking!;
+		expect(after.text).toContain(EXTENSION_FACT);
+		expect(after.text).not.toContain(REASONING);
+		expect(after.images).toEqual(variant.archive.frames.map(frame => frame.data));
 	});
 });
