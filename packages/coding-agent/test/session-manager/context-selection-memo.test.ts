@@ -7,6 +7,7 @@ import {
 	type BuildSessionContextOptions,
 	buildSessionContext,
 	buildSessionContextFromLeafPath,
+	getReadableCompactionEntry,
 	type SessionContext,
 	selectSessionContextEntriesFromLeafPath,
 	sessionContextEntryMetadata,
@@ -381,6 +382,44 @@ describe("SessionManager context selection memo", () => {
 			expect(JSON.stringify(reopened.buildSessionContext({ model: gpt }).messages)).not.toContain(
 				"BEHIND THE COMPACTION",
 			);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("finds the compaction each model reads from the index as a scan of the branch does", async () => {
+		using dir = TempDir.createSync("@context-selection-readable-compaction-");
+		const session = SessionManager.create(dir.path(), dir.path());
+		const file = session.getSessionFile();
+		if (!file) throw new Error("Expected a session file");
+		let local: string;
+		let remote: string;
+		try {
+			const first = session.appendMessage(user("first"));
+			session.appendMessage(reply());
+			local = session.appendCompaction("Local summary any model reads.", undefined, first, 1000);
+			const second = session.appendMessage(user("second"));
+			session.appendMessage(reply());
+			remote = session.appendCompaction("Remote compaction placeholder.", undefined, second, 1000, {
+				method: "remote",
+				preserveData: { openaiRemoteCompaction: { provider: gpt.provider, replacementHistory: [] } },
+			});
+			session.appendMessage(user("after the compactions"));
+		} finally {
+			await session.close();
+		}
+		const reopened = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+		try {
+			const branch = reopened.getBranch();
+			for (const [model, expected] of [
+				[claude, local],
+				[gpt, remote],
+				[undefined, remote],
+			] as const) {
+				const name = model?.id ?? "no model";
+				expect({ name, id: reopened.getReadableCompactionEntry(model)?.id }).toEqual({ name, id: expected });
+				expect(getReadableCompactionEntry(branch, model)?.id).toBe(expected);
+			}
 		} finally {
 			await reopened.close();
 		}

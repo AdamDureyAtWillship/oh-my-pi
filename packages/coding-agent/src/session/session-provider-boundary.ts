@@ -18,11 +18,7 @@ import { describeAttachedImagesForTextModel, shouldDescribeImagesForTextModel } 
 import { blobExtensionForImageMimeType } from "@oh-my-pi/pi-tui/prompt/image-format";
 import { type CustomMessage, convertToLlm } from "./messages";
 import { IMAGE_ATTACHMENT_DESCRIPTION_TYPE } from "./queued-messages";
-import {
-	getReadableCompactionEntry,
-	type SessionContext,
-	type TranscriptSessionContextOptions,
-} from "./session-context";
+import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
 import type { CostGateApi } from "./cost-gate";
 import type { SessionManager } from "./session-manager";
 
@@ -133,8 +129,8 @@ export class SessionProviderBoundary {
 	 * provider-native compaction the other can), so the context built for one does not serve the other.
 	 */
 	readsOtherCompaction(a: Model | undefined, b: Model | undefined): boolean {
-		const branch = this.#host.sessionManager.getBranch();
-		return getReadableCompactionEntry(branch, a) !== getReadableCompactionEntry(branch, b);
+		const sessionManager = this.#host.sessionManager;
+		return sessionManager.getReadableCompactionEntry(a)?.id !== sessionManager.getReadableCompactionEntry(b)?.id;
 	}
 
 	/**

@@ -116,7 +116,6 @@ import {
 	buildSessionContextFromLeafPath,
 	getLatestCompactionEntry,
 	getOpenAiRemoteCompactionPayload,
-	getReadableCompactionEntry,
 } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
@@ -3744,9 +3743,10 @@ export class SessionMaintenance {
 		// A larger window only helps when the target reads this same context. One
 		// that cannot replay the compaction it stands on reads the history behind
 		// it instead, so promote only when that history fits too.
-		const branch = this.#host.sessionManager.getBranch();
+		const sessionManager = this.#host.sessionManager;
 		if (
-			getReadableCompactionEntry(branch, candidate) !== getReadableCompactionEntry(branch, currentModel) &&
+			sessionManager.getReadableCompactionEntry(candidate)?.id !==
+				sessionManager.getReadableCompactionEntry(currentModel)?.id &&
 			!this.contextFitsModel(candidate)
 		) {
 			return undefined;
@@ -4502,10 +4502,11 @@ export class SessionMaintenance {
 		const storedExcludedTokens = activeExcludedMessage
 			? tokenizer.countMessage(activeExcludedMessage, { excludeEncryptedReasoning: true })
 			: 0;
-		const branch = this.#host.sessionManager.getBranch();
+		const sessionManager = this.#host.sessionManager;
 		if (
 			this.#model &&
-			getReadableCompactionEntry(branch, model) !== getReadableCompactionEntry(branch, this.#model)
+			sessionManager.getReadableCompactionEntry(model)?.id !==
+				sessionManager.getReadableCompactionEntry(this.#model)?.id
 		) {
 			// `model` stands on another compaction boundary than the active model
 			// (it cannot replay a provider-native compaction, or can replay one the

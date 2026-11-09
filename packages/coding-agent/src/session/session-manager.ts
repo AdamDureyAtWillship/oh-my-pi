@@ -4597,6 +4597,17 @@ export class SessionManager {
 	}
 
 	/**
+	 * The newest compaction on the current branch that `model` can read, as `getReadableCompactionEntry`
+	 * finds it on the branch, or null; only compactions are read. Without a model, the newest compaction.
+	 */
+	getReadableCompactionEntry(model: Model | undefined): CompactionEntry | null {
+		for (const entry of this.iterateBranch("compaction", { newestFirst: true })) {
+			if (entry.type === "compaction" && (!model || readsCompactionBoundary(entry, model))) return entry;
+		}
+		return null;
+	}
+
+	/**
 	 * The active-leaf branch (same entries as `getBranch()`) without the
 	 * defensive copy. The array is the manager's memo: never mutate it. It is
 	 * live — an entry appended to the current leaf is pushed onto it — so use
