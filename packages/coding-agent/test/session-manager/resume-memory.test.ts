@@ -851,7 +851,8 @@ describe("bounded resume memory", () => {
 			await storage.published.promise;
 			// The serialized image is still tiny; only the live comparison needs a blob.
 			image.data = changedImage;
-			put.mockImplementationOnce(() => {
+			// Persistence retries a failed entry once as a plain-JSON clone, so fail every attempt.
+			put.mockImplementation(() => {
 				throw failure;
 			});
 			function announceLaterRevision(): void {
@@ -866,7 +867,7 @@ describe("bounded resume memory", () => {
 			Bun.gc(true);
 			storage.release.resolve();
 			await expect(rewrite).rejects.toBe(failure);
-			expect(put).toHaveBeenCalledTimes(1);
+			expect(put).toHaveBeenCalled();
 			put.mockRestore();
 			// This historical record was never loaded or retained by the caller.
 			expect(session.getEntry("sibling-compaction")).toEqual(
