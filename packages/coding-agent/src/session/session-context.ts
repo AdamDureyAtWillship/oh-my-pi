@@ -264,6 +264,19 @@ export function getReadableCompactionEntry(
 	return null;
 }
 
+/**
+ * Whether `model` reads `boundary`, the compaction a context selection starts from. A model that
+ * cannot replay it reads the history behind it instead (see {@link getReadableCompactionEntry}).
+ */
+export function readsCompactionBoundary(boundary: CompactionEntry | undefined, model: Model): boolean {
+	return !boundary || canReplayRemoteCompaction(boundary.preserveData, model);
+}
+
+/** Models with one key replay the same compactions: it holds what {@link canReplayRemoteCompaction} reads. */
+export function compactionReplayKey(model: Model): string {
+	return `${model.provider}\u0000${model.api}`;
+}
+
 /** Payload-free facts needed to select the model/display dependency closure. */
 export interface SessionContextEntryMetadata {
 	id: string;
@@ -306,8 +319,8 @@ export function selectSessionContextEntriesFromLeafPath(
 	// buildSessionContextFromLeafPath; an unreadable one re-expands the history behind it.
 	const readable = (index: number): boolean => {
 		if (!options?.model || options.transcript) return true;
-		const compaction = read(path[index].id) as CompactionEntry;
-		return canReplayRemoteCompaction(compaction.preserveData, options.model);
+		const compaction = read(path[index].id);
+		return compaction.type !== "compaction" || readsCompactionBoundary(compaction, options.model);
 	};
 	let compactionIdx = -1;
 	let resetIdx = -1;

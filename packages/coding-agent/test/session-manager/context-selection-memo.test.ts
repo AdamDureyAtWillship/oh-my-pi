@@ -1,10 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
-import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Message, Model } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { CONTEXT_NOTES_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/session/context-notes";
 import {
 	type BuildSessionContextOptions,
 	buildSessionContext,
+	buildSessionContextFromLeafPath,
 	type SessionContext,
 	selectSessionContextEntriesFromLeafPath,
 	sessionContextEntryMetadata,
@@ -20,6 +22,15 @@ import { makeAssistantMessage } from "./helpers";
 
 const ISO = "2026-10-26T00:00:00.000Z";
 const COLLAPSED: BuildSessionContextOptions = { transcript: true, collapseCompactedHistory: true };
+
+function bundled(provider: "openai" | "anthropic", modelId: string): Model {
+	const model = getBundledModel(provider, modelId);
+	if (!model) throw new Error(`Expected bundled ${provider}/${modelId}`);
+	return model;
+}
+
+const gpt = bundled("openai", "gpt-5.4");
+const claude = bundled("anthropic", "claude-opus-5-5");
 
 let clock = 0;
 
@@ -320,6 +331,56 @@ describe("SessionManager context selection memo", () => {
 		const reopened = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
 		try {
 			expect(reopened.buildSessionContext()).toEqual(live!);
+		} finally {
+			await reopened.close();
+		}
+	});
+
+	it("selects the history behind a compaction the reading model cannot replay, on a reopened session", async () => {
+		using dir = TempDir.createSync("@context-selection-readable-boundary-");
+		const session = SessionManager.create(dir.path(), dir.path());
+		const file = session.getSessionFile();
+		if (!file) throw new Error("Expected a session file");
+		try {
+			session.appendMessage(user("BEHIND THE COMPACTION"));
+			const kept = session.appendMessage(reply());
+			// Only the OpenAI lane that wrote it can replay a remote compaction's payload.
+			session.appendCompaction("Remote compaction placeholder.", undefined, kept, 1000, {
+				method: "remote",
+				preserveData: { openaiRemoteCompaction: { provider: gpt.provider, replacementHistory: [] } },
+			});
+			session.appendMessage(user("after the compaction"));
+		} finally {
+			await session.close();
+		}
+		const reopened = await SessionManager.open(file, dir.path(), undefined, { suppressBreadcrumb: true });
+		try {
+			// Each model reads what the canonical builder gives it from every entry, before and after an
+			// append extends the selections; Claude again reuses the selection it was given first.
+			for (const step of ["reopened", "after an append"]) {
+				if (step === "after an append") reopened.appendMessage(user("after the reopen"));
+				await reopened.flush();
+				const entries = reopened.getEntries();
+				const leaf = reopened.getLeafId();
+				for (const model of [claude, gpt, claude]) {
+					const expected = {
+						step,
+						model: model.id,
+						context: buildSessionContext(entries, leaf, undefined, { model }),
+					};
+					expect({ step, model: model.id, context: reopened.buildSessionContext({ model }) }).toEqual(expected);
+					const branch = reopened.getContextBranch(model).toReversed();
+					expect({ step, model: model.id, context: buildSessionContextFromLeafPath(branch, { model }) }).toEqual(
+						expected,
+					);
+				}
+			}
+			expect(JSON.stringify(reopened.buildSessionContext({ model: claude }).messages)).toContain(
+				"BEHIND THE COMPACTION",
+			);
+			expect(JSON.stringify(reopened.buildSessionContext({ model: gpt }).messages)).not.toContain(
+				"BEHIND THE COMPACTION",
+			);
 		} finally {
 			await reopened.close();
 		}

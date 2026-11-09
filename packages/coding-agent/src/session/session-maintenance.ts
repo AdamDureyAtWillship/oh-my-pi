@@ -4241,7 +4241,7 @@ export class SessionMaintenance {
 			this.#tokenizer,
 			this.#host.settings.revision,
 		);
-		const branch = this.#host.sessionManager.getContextBranch();
+		const branch = this.#host.sessionManager.getContextBranch(this.#model);
 		const leaf = branch.at(-1);
 		const archive = snapcompact.getPreservedArchive(args.preserveData);
 		const blocks = archive
@@ -4316,7 +4316,9 @@ export class SessionMaintenance {
 	 * Current branch context tokens in the same `buildSessionContext` +
 	 * {@link #countProjectedMessages} domain as {@link #projectCompactionContextTokens}.
 	 */
-	#projectCurrentBranchContextTokens(branch: SessionEntry[] = this.#host.sessionManager.getContextBranch()): number {
+	#projectCurrentBranchContextTokens(
+		branch: SessionEntry[] = this.#host.sessionManager.getContextBranch(this.#model),
+	): number {
 		const nonMessageTokens = computeNonMessageTokens(
 			this.#host.nonMessageTokenSource(),
 			this.#tokenizer,

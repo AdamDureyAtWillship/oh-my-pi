@@ -4,6 +4,7 @@ import type {
 	ImageContent,
 	Message,
 	MessageAttribution,
+	Model,
 	ServiceTierByFamily,
 	TextContent,
 	Usage,
@@ -48,8 +49,10 @@ import type { RetryFallbackRole } from "./retry-fallback-chains";
 import {
 	type BuildSessionContextOptions,
 	buildSessionContextFromLeafPath,
+	compactionReplayKey,
 	isExplicitDefaultModelChange,
 	leafAppendExtendsContextSelection,
+	readsCompactionBoundary,
 	selectSessionContextEntriesFromLeafPath,
 	type SessionContextEntryMetadata,
 	sessionContextEntryMetadata,
@@ -567,10 +570,14 @@ interface IndexedSessionEntry extends Omit<PositionedSessionEntry, "offset" | "l
 interface SelectedContext {
 	generation: number;
 	leaf: string | null;
+	/** The compaction {@link provider} starts from, unless a newer reset boundary bounds it. */
+	boundary: CompactionEntry | undefined;
 	provider: SessionEntry[];
 	display: SessionEntry[];
 	/** No explicit default model change is on the path, so the newest assistant stands in for one. */
 	inferredModel: boolean;
+	/** The provider selection of models that cannot replay {@link boundary}, which read the history behind it. */
+	behind: { key: string; provider: SessionEntry[]; inferredModel: boolean } | undefined;
 }
 
 type MetadataEdit = "parent" | "metadata";
@@ -805,6 +812,9 @@ export class SessionEntryIndex {
 				context.display.push(entry);
 				context.leaf = entry.id;
 				this.#active.set(entry.id, entry);
+				const behind = context.behind;
+				if (behind && leafAppendExtendsContextSelection(entry, behind.inferredModel)) behind.provider.push(entry);
+				else context.behind = undefined;
 			}
 			context.generation = this.#generation;
 		} else {
@@ -1064,13 +1074,41 @@ export class SessionEntryIndex {
 			return selectSessionContextEntriesFromLeafPath(leafFirst, id => this.get(id)!, options);
 		}
 		const context = this.#selectedContext();
-		return (options?.transcript ? context.display : context.provider).slice().reverse();
+		return (options?.transcript ? context.display : this.#providerFor(context, options?.model)).slice().reverse();
 	}
-	/** The current leaf's ordered provider/display union; all payloads are already retained. */
-	contextBranch(): SessionEntry[] {
+	/**
+	 * The current leaf's ordered provider/display union, the provider selection being the one `model`
+	 * reads when given; all payloads are already retained.
+	 */
+	contextBranch(model?: Model): SessionEntry[] {
 		if (this.#leaf !== this.contextLeafId()) return [];
-		this.#selectedContext();
-		return [...this.#active.values()];
+		const context = this.#selectedContext();
+		const provider = this.#providerFor(context, model);
+		if (provider === context.provider) return [...this.#active.values()];
+		// Both selections are subsequences of the path: merge them in its order.
+		const selected = new Map<string, SessionEntry>();
+		for (const entry of provider) selected.set(entry.id, entry);
+		for (const entry of context.display) selected.set(entry.id, entry);
+		const union: SessionEntry[] = [];
+		for (const metadata of this.#leafPath(context.leaf)) {
+			const entry = selected.get(metadata.id);
+			if (entry) union.push(entry);
+		}
+		return union;
+	}
+	/**
+	 * The provider selection `model` reads: the memoized one, or, for a model that cannot replay the
+	 * boundary compaction, the history behind it, memoized per replay key and extended like the other.
+	 */
+	#providerFor(context: SelectedContext, model: Model | undefined): SessionEntry[] {
+		if (!model || readsCompactionBoundary(context.boundary, model)) return context.provider;
+		const key = compactionReplayKey(model);
+		if (context.behind?.key !== key) {
+			const leafFirst = this.#leafPath(context.leaf).slice().reverse();
+			const provider = selectSessionContextEntriesFromLeafPath(leafFirst, id => this.get(id)!, { model }).reverse();
+			context.behind = { key, provider, inferredModel: !provider.some(isExplicitDefaultModelChange) };
+		}
+		return context.behind.provider;
 	}
 	/** The provider and collapsed-display selections for the context's leaf, which are the retained payloads. */
 	#selectedContext(): SelectedContext {
@@ -1094,12 +1132,23 @@ export class SessionEntryIndex {
 			this.#active.delete(metadata.id);
 			this.#active.set(metadata.id, entry);
 		}
+		// The newest compaction bounds the provider selection unless a newer reset boundary does.
+		let boundary: CompactionEntry | undefined;
+		for (const metadata of leafFirst) {
+			if (metadata.type === "reset_boundary") break;
+			if (metadata.type !== "compaction") continue;
+			const entry = read(metadata.id);
+			if (entry.type === "compaction") boundary = entry;
+			break;
+		}
 		const context: SelectedContext = {
 			generation: this.#generation,
 			leaf,
+			boundary,
 			provider,
 			display,
 			inferredModel: !provider.some(isExplicitDefaultModelChange),
+			behind: undefined,
 		};
 		this.#contextCache = context;
 		return context;
@@ -4438,9 +4487,12 @@ export class SessionManager {
 		return this.#index.pathTo(fromId ?? this.#index.leafId());
 	}
 
-	/** Materialize only the current leaf's model/collapsed-display dependency closure. */
-	getContextBranch(): SessionEntry[] {
-		return this.#index.contextBranch();
+	/**
+	 * Materialize only the current leaf's model/collapsed-display dependency closure. With `model`, the
+	 * model part is what that model reads: the history behind a compaction it cannot replay.
+	 */
+	getContextBranch(model?: Model): SessionEntry[] {
+		return this.#index.contextBranch(model);
 	}
 
 	/** Number of entries in the session, or of one type; reads no entry. */
