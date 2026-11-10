@@ -6475,11 +6475,14 @@ export class SessionMaintenance {
 				isRecord(args.details) && args.details.kind === "experimental-context-rollover"
 					? this.#projectExperimentalContextRolloverTokens(args)
 					: this.#projectCompactedContextTokens(args);
-			if (savedCompactionEntry.tokensAfter !== postRescueTokensAfter) {
-				savedCompactionEntry.tokensAfter = postRescueTokensAfter;
-				this.#host.sessionManager.updateEntry(savedCompactionEntry);
-				await this.#host.sessionManager.rewriteEntries();
-			}
+			// `tokensAfter` is display metadata: the transcript divider and the stats
+			// trace marker. Correct it on the retained entry without `updateEntry` or
+			// `rewriteEntries`: either would rewrite the whole session file, and
+			// serializing a long session's body holds all of it in memory (about
+			// 1.3 GB extra for a 477 MB file). The journal keeps the count recorded
+			// when the compaction committed, so a resumed session, a re-read entry
+			// and a mirrored view of a worker-homed one show that count instead.
+			savedCompactionEntry.tokensAfter = postRescueTokensAfter;
 		}
 		const deadEndWarning = noProgressDeadEnd ? this.#compactionDeadEndWarning("clear large tool output") : undefined;
 		if (deadEndWarning) {

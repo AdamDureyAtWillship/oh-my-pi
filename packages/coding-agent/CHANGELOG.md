@@ -11,6 +11,7 @@
 - Resuming long compacted sessions now keeps only the active context in memory while leaving older history available for navigation, exports, and edits ([#16517](https://github.com/can1357/oh-my-pi/pull/16517) by [@Komzpa](https://github.com/Komzpa))
 - Long-running sessions no longer retain discarded history or re-read the whole branch on every turn
 - Transcript replay, manual compaction, and context-overflow recovery no longer load discarded history just to count entries or find a compaction
+- Automatic compaction no longer rewrites the whole session file to correct the compaction's after-count once a rescue or a following eval snapshot changes the context; the corrected count stays in memory, and the journal keeps the committed one
 
 ## [18.18.3] - 2026-11-09
 

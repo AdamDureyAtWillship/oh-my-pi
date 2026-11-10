@@ -1789,7 +1789,12 @@ describe("AgentSession auto-compaction progress guard", () => {
 				? { tokens: 1000, contextWindow: 200000, percent: 0.5 }
 				: { tokens: 190000, contextWindow: 200000, percent: 95 },
 		);
-		const updateEntry = vi.spyOn(sessionManager, "updateEntry");
+		const committedTokensAfter: Array<number | undefined> = [];
+		const appendCompaction = sessionManager.appendCompaction.bind(sessionManager);
+		vi.spyOn(sessionManager, "appendCompaction").mockImplementation((...args) => {
+			committedTokensAfter.push(args[4]?.tokensAfter);
+			return appendCompaction(...args);
+		});
 		const shakeSpy = vi.spyOn(session, "shake").mockImplementation(async () => {
 			shaken = true;
 			const tail = sessionManager.getContextBranch().findLast(entry => entry.type === "message");
@@ -1822,7 +1827,12 @@ describe("AgentSession auto-compaction progress guard", () => {
 		const recovery = notices.filter(n => n.source === NOTICE_SOURCE && n.message.includes("dead-end recovery"));
 		expect(recovery.length).toBe(1);
 		expect(recovery[0].level).toBe("info");
-		expect(updateEntry.mock.calls.filter(([entry]) => entry.type === "compaction")).toHaveLength(1);
+		// The divider counts the context the rescue left, not the one the commit projected.
+		expect(committedTokensAfter).toHaveLength(1);
+		const committed = committedTokensAfter[0];
+		const latest = sessionManager.getLatestCompactionEntry();
+		if (committed === undefined || latest?.tokensAfter === undefined) throw new Error("Expected tokensAfter counts");
+		expect(latest.tokensAfter).toBeLessThan(committed);
 	});
 
 	it("still warns when a shake rescue cannot free the irreducible tail", async () => {
