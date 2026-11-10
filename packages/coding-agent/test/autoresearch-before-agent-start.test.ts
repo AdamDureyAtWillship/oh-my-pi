@@ -52,16 +52,17 @@ function makeCtx(cwd: string): ExtensionContext {
 		hasPendingMessages: () => false,
 		sessionManager: {
 			getSessionId: () => "session-bas-test",
-			getBranch: () => [
-				{
-					type: "custom",
-					customType: "autoresearch-control",
-					id: "ctrl-1",
-					parentId: null,
-					timestamp: new Date(0).toISOString(),
-					data: { mode: "on", goal: "speed up the thing" },
-				},
-			],
+			iterateBranch: () =>
+				[
+					{
+						type: "custom",
+						customType: "autoresearch-control",
+						id: "ctrl-1",
+						parentId: null,
+						timestamp: new Date(0).toISOString(),
+						data: { mode: "on", goal: "speed up the thing" },
+					},
+				].values(),
 		},
 	} as unknown as ExtensionContext;
 }

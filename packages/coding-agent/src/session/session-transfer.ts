@@ -676,7 +676,12 @@ export async function markSessionMoved(sessionFile: string, label: string): Prom
  * return `manager` itself.
  */
 export async function forkIfMovedAway(manager: SessionManager, sessionDir?: string): Promise<SessionManager> {
-	const marker = lastSessionTransfer(manager.getEntries());
+	let marker: SessionTransferDetails | undefined;
+	// Only custom messages, newest first: a long session's other history stays on disk.
+	for (const entry of manager.iterateEntries("custom_message", { newestFirst: true })) {
+		marker = sessionTransferDetails(entry);
+		if (marker) break;
+	}
 	if (marker?.kind !== "departed") return manager;
 	const source = manager.getSessionFile();
 	if (!source) return manager;

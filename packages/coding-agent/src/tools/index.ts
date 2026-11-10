@@ -355,7 +355,12 @@ export interface ToolSession {
 		Partial<
 			Pick<
 				SessionManager,
-				"getSessionId" | "getLeafId" | "getBranchMatching" | "appendModelUsage" | "getArtifactContent"
+				| "getSessionId"
+				| "getLeafId"
+				| "getBranchMatching"
+				| "iterateEntries"
+				| "appendModelUsage"
+				| "getArtifactContent"
 			>
 		>;
 	/** Get eval kernel owner ID for session-scoped retained-kernel cleanup. */

@@ -34,6 +34,7 @@ import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { SessionContextEntryMetadata } from "../session/session-context";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -693,7 +694,11 @@ export class VibeSessionRegistry {
 		const scope = this.ownerScope(session);
 		const allSpawns = new Map<string, VibeSpawnLifecycleEvent>();
 		const terminalIntents = new Map<string, VibeTombstoneReason>();
-		for (const entry of sessionManager.getEntries()) {
+		// Only lifecycle entries: a long session's other history stays on disk.
+		const isLifecycle = (metadata: SessionContextEntryMetadata) => metadata.customType === VIBE_LIFECYCLE_CUSTOM_TYPE;
+		const journal =
+			sessionManager.iterateEntries?.("custom", { matching: isLifecycle }) ?? sessionManager.getEntries();
+		for (const entry of journal) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;
@@ -705,7 +710,8 @@ export class VibeSessionRegistry {
 		}
 
 		const candidates = new Map<string, VibeRestoreCandidate>();
-		for (const entry of sessionManager.getBranch()) {
+		const branch = sessionManager.getBranchMatching?.(isLifecycle) ?? sessionManager.getBranch();
+		for (const entry of branch) {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;

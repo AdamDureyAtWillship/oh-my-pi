@@ -48,7 +48,14 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const rehydrate = async (ctx: ExtensionContext): Promise<void> => {
 		const runtime = getRuntime(ctx);
-		const control = reconstructControlState(ctx.sessionManager.getBranch());
+		// Only the control entries: a long session's other history stays on disk.
+		const control = reconstructControlState(
+			Array.from(
+				ctx.sessionManager.iterateBranch("custom", {
+					matching: metadata => metadata.customType === "autoresearch-control",
+				}),
+			),
+		);
 		runtime.goal = control.goal;
 		runtime.autoResumeArmed = false;
 		runtime.lastAutoResumePendingRunNumber = null;
