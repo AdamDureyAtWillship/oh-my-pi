@@ -840,6 +840,11 @@ export class SessionEntryIndex {
 	records(): readonly IndexedSessionEntry[] {
 		return this.#ordered;
 	}
+	/** {@link records} once in-place edits of the payloads the index holds are in their metadata, for filtered reads. */
+	refreshedRecords(): readonly IndexedSessionEntry[] {
+		this.#refreshRetained();
+		return this.#ordered;
+	}
 	*entriesOfType(type?: SessionEntry["type"]): IterableIterator<SessionEntry> {
 		for (const entry of this.#ordered) if (!type || entry.type === type) yield this.get(entry.id, false)!;
 	}
@@ -4507,7 +4512,7 @@ export class SessionManager {
 	iterateEntries(type?: SessionEntry["type"], options?: SessionEntryIterationOptions): IterableIterator<SessionEntry> {
 		const index = this.#index;
 		return readEach(
-			() => index.records(),
+			() => index.refreshedRecords(),
 			record => index.get(record.id, false)!,
 			type,
 			options,

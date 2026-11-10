@@ -32,6 +32,30 @@ it("refreshes retained metadata and parent changes after repeated branch selecti
 	}
 });
 
+it("refreshes retained metadata before a filtered journal read", async () => {
+	const manager = SessionManager.inMemory();
+	try {
+		const first = manager.appendCustomEntry("checkpoint", { revision: 1 });
+		const middle = manager.appendCustomEntry("unrelated", {});
+		const select = () =>
+			Array.from(
+				manager.iterateEntries("custom", { matching: metadata => metadata.customType === "checkpoint" }),
+				entry => entry.id,
+			);
+		expect(select()).toEqual([first]);
+		const retained = manager.getEntry(middle);
+		if (!retained || retained.type !== "custom") throw new Error("Missing custom entry");
+		retained.customType = "checkpoint";
+		expect(select()).toEqual([first, middle]);
+		expect(Array.from(manager.iterateEntries("custom", { newestFirst: true }), entry => entry.id)).toEqual([
+			middle,
+			first,
+		]);
+	} finally {
+		await manager.close();
+	}
+});
+
 it("finds the conversation tip of a reopened session as a scan of every entry does", async () => {
 	using dir = TempDir.createSync("@conversation-tip-");
 	const session = SessionManager.create(dir.path(), dir.path());
